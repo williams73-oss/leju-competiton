@@ -321,7 +321,7 @@ class ClawController:
 
     def __init__(self):
         # 服务客户端
-        rospy.wait_for_service("/control_robot_leju_claw", timeout=5.0)
+        rospy.wait_for_service("/control_robot_leju_claw", timeout=60.0)
         self._srv = rospy.ServiceProxy("/control_robot_leju_claw", controlLejuClaw)
 
         # 状态缓存（订阅 /leju_claw_state 更新）

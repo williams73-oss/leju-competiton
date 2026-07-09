@@ -17,3 +17,5 @@ Thumbs.db
 
 # Logs
 *.log
+
+# log_fr/ : notes perso FR — pousser sur williams (repo perso), pas sur origin (groupe qllzz)

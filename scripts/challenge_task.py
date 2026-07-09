@@ -29,6 +29,78 @@ SCENE_CONFIGS = {
 }
 
 
+class _NullClaw(object):
+    """夹爪服务不可用时的占位（仅场景一传感器测试）。"""
+
+    def open(self, position=None):
+        import rospy
+        rospy.logwarn(">>> 警告：夹爪不可用，open() 已跳过")
+
+    def close(self, position=None):
+        import rospy
+        rospy.logwarn(">>> 警告：夹爪不可用，close() 已跳过")
+
+    def set_position(self, left_percent, right_percent):
+        import rospy
+        rospy.logwarn(">>> 警告：夹爪不可用，set_position() 已跳过")
+
+    def left_open(self):
+        self.open()
+
+    def left_close(self):
+        self.close()
+
+    def right_open(self):
+        self.open()
+
+    def right_close(self):
+        self.close()
+
+    def is_grabbed(self):
+        return False
+
+    def is_moving(self):
+        return False
+
+    def wait_until_done(self, timeout=5.0):
+        return True
+
+
+def _wait_for_claw_service(log, timeout=120.0):
+    import rospy
+    import time
+
+    log("等待夹爪服务 /control_robot_leju_claw（最多 %.0f 秒）...", timeout)
+    start = time.time()
+    last_progress = -15
+    while time.time() - start < timeout:
+        try:
+            rospy.wait_for_service("/control_robot_leju_claw", timeout=5.0)
+            log("夹爪服务已连接。")
+            return True
+        except rospy.ROSException:
+            elapsed = int(time.time() - start)
+            if elapsed - last_progress >= 15:
+                last_progress = elapsed
+                log("仍在等待夹爪服务… %d 秒", elapsed)
+    return False
+
+
+def _create_claw(log, scene, ClawController):
+    import rospy
+
+    if not _wait_for_claw_service(log, timeout=120.0):
+        log("夹爪服务超时。诊断: rosnode list | grep sim_leju ; rosservice list | grep claw")
+        log("请 Ctrl+C 后 killall roslaunch，再单独启动一次 rosrun")
+        if scene == "scene1":
+            log("警告：场景一传感器测试继续（无夹爪）")
+            return _NullClaw()
+        raise rospy.ROSException(
+            "timeout exceeded while waiting for service /control_robot_leju_claw"
+        )
+    return ClawController()
+
+
 def _load_launcher():
     # 公共启动器位于受保护包 challenge_cup_simulator/utils/（选手不可改动），
     # 从那里导入，确保完整性校验无法被绕过。
@@ -61,13 +133,11 @@ def run_scene(scene, seed, node_name=None, timeout=120,
 
     import rospy
 
-    # ---- 日志工具（同时输出到 ROS 日志和终端）----
     def log(msg, *args):
         if args:
             msg = msg % args
         rospy.loginfo(">>> " + msg)
 
-    # ---- 引入控制 API 和场景模块 ----
     _scripts_dir = os.path.dirname(os.path.abspath(__file__))
     _pkg_dir = os.path.dirname(_scripts_dir)
     sys.path.insert(0, os.path.join(_pkg_dir, "src"))
@@ -77,15 +147,20 @@ def run_scene(scene, seed, node_name=None, timeout=120,
 
     log("=== %s任务启动 ===", config["title"])
 
+    log("等待 ROS 节点就绪（10 秒）…")
+    rospy.sleep(10.0)
+
+    log("初始化 RobotMover...")
     robot = RobotMover()
+    log("初始化 ArmController...")
     arm = ArmController()
-    claw = ClawController()
+    claw = _create_claw(log, scene, ClawController)
+    log("初始化 HeadController...")
     head = HeadController()
 
     rospy.sleep(1.0)
     log("场景实例已初始化，控制器就绪。")
 
-    # ---- 根据 scene 参数分发到对应模块 ----
     if scene == "scene1":
         from scene1_task import run_scene1
         run_scene1(robot, arm, claw, head, log)
