@@ -21,9 +21,11 @@
 
 import rospy
 import numpy as np
+import struct
 
 # ---- ROS 消息类型 ----
 from sensor_msgs.msg import CompressedImage, PointCloud2, JointState, Imu, CameraInfo
+from sensor_msgs import point_cloud2 as pc2
 from kuavo_msgs.msg import sensorsData
 from geometry_msgs.msg import TransformStamped
 import tf2_ros
@@ -60,13 +62,24 @@ class CameraReader:
         "right_rgb":  "/cam_r/color/image_raw/compressed",
         "right_depth":"/cam_r/depth/image_rect_raw/compressedDepth",
     }
+    INFO_TOPICS = {
+        "head": "/cam_h/color/camera_info",
+        "left": "/cam_l/color/camera_info",
+        "right": "/cam_r/color/camera_info",
+    }
+    DEPTH_FRAME = {
+        "head": "Head Camera View",
+        "left": "Left Wrist Camera View",
+        "right": "Right wrist Camera View",
+    }
 
     def __init__(self):
         if not _HAS_CV2:
             rospy.logwarn("CameraReader: 未安装 opencv-python，图像解码不可用。"
                           "请在容器内执行: pip install opencv-python")
 
-        self._cache = {}  # key → (header, raw_data)
+        self._cache = {}  # key → CompressedImage
+        self._cam_info = {}  # head|left|right → dict fx,fy,cx,cy,frame_id
 
         # 订阅所有图像话题
         self._subs = {}
@@ -76,8 +89,34 @@ class CameraReader:
                 lambda msg, k=key: self._callback(k, msg),
                 queue_size=1
             )
+        for key, topic in self.INFO_TOPICS.items():
+            rospy.Subscriber(
+                topic, CameraInfo,
+                lambda msg, k=key: self._info_callback(k, msg),
+                queue_size=1
+            )
 
         rospy.sleep(0.3)  # 等第一帧到来
+
+    def _info_callback(self, key, msg):
+        self._cam_info[key] = {
+            "fx": float(msg.K[0]),
+            "fy": float(msg.K[4]),
+            "cx": float(msg.K[2]),
+            "cy": float(msg.K[5]),
+            "width": int(msg.width),
+            "height": int(msg.height),
+            "frame_id": msg.header.frame_id or self.DEPTH_FRAME.get(key, key),
+        }
+
+    def wait_for_frame(self, key="head_rgb", timeout=2.0, poll=0.05):
+        """等待指定相机至少收到一帧。"""
+        deadline = rospy.Time.now() + rospy.Duration(timeout)
+        while rospy.Time.now() < deadline and not rospy.is_shutdown():
+            if self._cache.get(key) is not None:
+                return True
+            rospy.sleep(poll)
+        return self._cache.get(key) is not None
 
     def _callback(self, key, msg):
         self._cache[key] = msg
@@ -110,6 +149,93 @@ class CameraReader:
         """返回右腕深度图。"""
         return self._get_depth("right_depth")
 
+    def get_camera_info(self, cam_key="head"):
+        """返回相机内参 dict，无数据返回 None。"""
+        return self._cam_info.get(cam_key)
+
+    def depth_valid_count(self, depth, z_min=0.35, z_max=1.2):
+        """统计有效深度像素数（米）。"""
+        if depth is None:
+            return 0
+        valid = np.isfinite(depth) & (depth > z_min) & (depth < z_max)
+        return int(valid.sum())
+
+    @staticmethod
+    def _quat_rotate(quat, point):
+        """四元数 (x,y,z,w) 旋转向量。"""
+        x, y, z, w = quat
+        vx, vy, vz = point
+        ix = w * vx + y * vz - z * vy
+        iy = w * vy + z * vx - x * vz
+        iz = w * vz + x * vy - y * vx
+        iw = -x * vx - y * vy - z * vz
+        return (
+            ix * w + iw * -x + iy * -z - iz * -y,
+            iy * w + iw * -y + iz * -x - ix * -z,
+            iz * w + iw * -z + ix * -y - iy * -x,
+        )
+
+    def pixel_to_base_link(self, tf_reader, cam_key, u_px, v_px, depth_m,
+                           target_frame="base_link"):
+        """
+        像素 + 深度 → base_link 3D 点（相机光学系：Z 前，X 右，Y 下）。
+        失败返回 None。
+        """
+        info = self.get_camera_info(cam_key)
+        if info is None or depth_m is None or depth_m <= 0:
+            return None
+        fx, fy, cx, cy = info["fx"], info["fy"], info["cx"], info["cy"]
+        frame_id = info["frame_id"]
+        x_c = (float(u_px) - cx) * depth_m / fx
+        y_c = (float(v_px) - cy) * depth_m / fy
+        z_c = float(depth_m)
+        pos, quat = tf_reader.lookup(target_frame, frame_id)
+        if pos is None:
+            return None
+        rx, ry, rz = self._quat_rotate(quat, (x_c, y_c, z_c))
+        return (pos[0] + rx, pos[1] + ry, pos[2] + rz)
+
+    def pixel_ray_to_table_plane(self, tf_reader, cam_key, u_px, v_px,
+                                 table_z=-0.04, target_frame="base_link"):
+        """
+        像素射线与 base_link 水平面 z=table_z 求交（不依赖深度值）。
+        适用于 colis sur table — depth 的 z 经常偏正。
+        """
+        info = self.get_camera_info(cam_key)
+        if info is None:
+            return None
+        fx, fy, cx, cy = info["fx"], info["fy"], info["cx"], info["cy"]
+        frame_id = info["frame_id"]
+        dir_c = ((float(u_px) - cx) / fx,
+                 (float(v_px) - cy) / fy,
+                 1.0)
+        pos, quat = tf_reader.lookup(target_frame, frame_id)
+        if pos is None:
+            return None
+        dx, dy, dz = self._quat_rotate(quat, dir_c)
+        if abs(dz) < 1e-6:
+            return None
+        t = (float(table_z) - pos[2]) / dz
+        if t <= 0:
+            return None
+        return (
+            pos[0] + t * dx,
+            pos[1] + t * dy,
+            float(table_z),
+        )
+
+    def median_depth_in_mask(self, depth, mask, z_min=0.35, z_max=1.2):
+        """在 mask 区域取深度中值（米），无效返回 None。"""
+        if depth is None or mask is None:
+            return None
+        if depth.shape[:2] != mask.shape[:2]:
+            return None
+        vals = depth[mask > 0]
+        vals = vals[np.isfinite(vals) & (vals > z_min) & (vals < z_max)]
+        if len(vals) < 5:
+            return None
+        return float(np.median(vals))
+
     # ---- 检查是否有新数据 ----
 
     def has_new(self, key="head_rgb"):
@@ -141,15 +267,39 @@ class CameraReader:
         if msg is None:
             return None
 
-        buf = np.frombuffer(msg.data, dtype=np.uint8)
-        raw = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)  # 保持原始 16-bit
+        data = bytes(msg.data)
+        depth_quant_a = depth_quant_b = None
+        if len(data) >= 12 and data[0] != 0x89:
+            depth_quant_a = struct.unpack("f", data[0:4])[0]
+            depth_quant_b = struct.unpack("f", data[4:8])[0]
+            png_data = data[12:]
+        else:
+            png_data = data
+
+        buf = np.frombuffer(png_data, dtype=np.uint8)
+        raw = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
 
         if raw is None:
             return None
 
-        # compressedDepth: 像素值 = depth_mm 的高 12 位 + 低 4 位
-        # 实际存储为 16-bit PNG，直接除以 1000 得到米
+        if len(raw.shape) == 3:
+            raw = raw[:, :, 0]
+
+        use_quant = (
+            depth_quant_a is not None
+            and abs(depth_quant_a) > 1e-6
+            and depth_quant_b is not None
+        )
+        if use_quant:
+            depth_m = depth_quant_a / (raw.astype(np.float32) - depth_quant_b)
+            depth_m[raw == 0] = np.nan
+            valid = np.isfinite(depth_m) & (depth_m > 0.01)
+            if int(valid.sum()) >= 10:
+                return depth_m
+
+        # Sim MuJoCo : quant a=b=0 → PNG 16-bit millimètres
         depth_m = raw.astype(np.float32) / 1000.0
+        depth_m[raw == 0] = np.nan
         return depth_m
 
 
@@ -176,31 +326,26 @@ class LidarReader:
         rospy.sleep(2.0)
 
     def _callback(self, msg):
-        """解析 PointCloud2 → numpy N×3。"""
+        """解析 PointCloud2 → numpy N×3（支持 mixed fields / 24 bytes/point）。"""
         try:
-            # 根据 msg.fields 动态解析字段
-            field_names = [f.name for f in msg.fields]
-            x_idx = field_names.index('x')
-            y_idx = field_names.index('y')
-            z_idx = field_names.index('z')
-
-            # 计算每个点的字节数
-            point_step = msg.point_step
-            n_points = msg.width * msg.height
-
-            # 读取为 flat float32 数组
-            buf = np.frombuffer(msg.data, dtype=np.float32)
-            n_floats_per_point = point_step // 4
-            pts = buf.reshape(n_points, n_floats_per_point)
-
-            self._points = np.column_stack([
-                pts[:, x_idx], pts[:, y_idx], pts[:, z_idx]
-            ])
+            pts = list(pc2.read_points(
+                msg, field_names=("x", "y", "z"), skip_nans=True))
+            if not pts:
+                return
+            self._points = np.asarray(pts, dtype=np.float32)
             self._header = msg.header
         except Exception as e:
             rospy.logwarn_throttle(10, "点云解析失败: %s, fields=%s",
                                    e, [f.name for f in msg.fields])
-            self._points = None
+
+    def wait_for_points(self, timeout=3.0, min_points=50, poll=0.1):
+        """等待至少 min_points 个点云到达。"""
+        deadline = rospy.Time.now() + rospy.Duration(timeout)
+        while rospy.Time.now() < deadline and not rospy.is_shutdown():
+            if self._points is not None and len(self._points) >= min_points:
+                return True
+            rospy.sleep(poll)
+        return self._points is not None and len(self._points) >= min_points
 
     def get_points(self):
         """返回点云 (N×3 numpy array)，单位 米。无数据返回 None。"""
