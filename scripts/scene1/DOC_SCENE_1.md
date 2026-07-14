@@ -11,10 +11,13 @@
 
 ## 0. Quelqu’un peut-il cloner et lancer ?
 
-**Oui**, s’il a déjà l’environnement officiel challenge cup (image Docker / `kuavo_ws`).  
-Ce dépôt n’est **pas** toute la simu : c’est le **paquet tâche** `challenge_cup_task_template` (Scene1 + `robot_api` étendu) à installer dans le workspace.
+**Oui sous conditions.**  
+Il faut l’env simu officiel + installer ce dépôt comme `challenge_cup_task_template` (§1).  
+Ce dépôt **n’est pas** toute la simu.
 
-Suivre **§1 De zéro**.
+- **Ce qui marche :** après §1, `rosrun … --scene scene1` lance la mission (detect → grasp → weigh → handoff → bac). Code + `robot_api` étendu présents.
+- **Pas garanti :** 4/4 sur tous les seeds. Meilleur cas documenté : seed **30**. Il faut OpenCV + services simu (pince / IK / FK).
+- **Ne marche pas seul :** clone sans Docker / `kuavo_ws` orga.
 
 ---
 
@@ -25,6 +28,13 @@ Suivre **§1 De zéro**.
 - Image / workspace officiel `kuavo_challenge_cup_2026` (comme un participant)
 - Savoir lancer la simu + `challenge_task.py` officiel
 - GPU / display comme l’orga
+- **Dépendances Python (vision) :** dans le conteneur / env simu :
+  ```bash
+  pip3 install opencv-python open3d
+  # ou le script monorepo docker/install_perception_deps.sh (pas dans ce dépôt GitHub)
+  ```
+  Sans `opencv-python` → couleur / wrist faibles ou skippés → mission peu crédible.  
+  Sans `open3d` → fallback LiDAR 2D (tourne, un peu moins bien).
 
 ### 1.2 Cloner
 

@@ -11,10 +11,13 @@
 
 ## 0. 别人能不能下载后直接跑？
 
-**可以**，前提是：对方已经有主办的 **挑战杯仿真工作空间 / Docker 镜像**（和官方选手环境一样）。  
-本仓库 **不是** 整套仿真，而是要放进工作空间的 **任务包**（`challenge_cup_task_template`）：Scene1 代码 + 扩展后的 `robot_api`。
+**能跑起来，有条件。**  
+对方必须已有主办仿真环境，并把本仓库装进 `challenge_cup_task_template`（见 §1）。  
+本仓库 **不是** 整套仿真。
 
-按下面 **§1 从零运行** 操作即可。
+- **能做的：** 按 §1 安装后，`rosrun … --scene scene1` 会启动完整任务（检测→抓→称→交接→投箱），代码与扩展 `robot_api` 齐全。
+- **不能保证的：** 每个 seed 都 4/4 成功。已验证较好例子含 seed **30**；成功依赖 OpenCV + 仿真服务（夹爪 / IK / FK）正常。
+- **不会单独工作：** 只 clone、没有主办 Docker / `kuavo_ws`。
 
 ---
 
@@ -25,6 +28,13 @@
 - 已安装主办环境：`kuavo_challenge_cup_2026` Docker 镜像（或等价 `kuavo_ws`）
 - 能正常启动仿真并跑官方 `challenge_task.py`
 - 有 GPU / 显示（与官方一样）
+- **Python 依赖（视觉必需）：** 在仿真容器 / 环境里安装：
+  ```bash
+  pip3 install opencv-python open3d
+  # 或你团队 monorepo 里的 docker/install_perception_deps.sh（本 GitHub 仓库不含该脚本）
+  ```
+  没有 `opencv-python` → 颜色/腕部视觉会弱或跳过，任务很难成功。  
+  没有 `open3d` → LiDAR 可回退 2D（能跑，质量略差）。
 
 ### 1.2 下载本仓库代码
 
