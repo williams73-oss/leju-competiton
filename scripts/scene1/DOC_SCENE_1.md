@@ -1,116 +1,190 @@
-# DOC SCENE 1 — Vision & saisie (notes d’équipe)
+# DOC SCENE 1 — Vision & saisie (équipe)
 
 **Auteur vision :** Williams  
-**Dernière MAJ :** 13 juillet 2026  
-**Rôle :** détection tête + refine caméra main. Handoff / chute à la passation = hors scope vision (contrôle).
+**Dernière MAJ :** 15 juillet 2026  
+**Rôle :** détection tête + refine caméra main ; grasp / weigh / handoff sur structure orga.
 
-Ce doc explique **ce qui a été fait**, **pourquoi**, **les pièges**, et **comment relancer**.  
-Il vit **à côté du code** dans ce dossier `scene1/`.
-
-**中文版（给中文同事）：** [`DOC_SCENE_1_zh.md`](./DOC_SCENE_1_zh.md)
+**中文版：** [`DOC_SCENE_1_zh.md`](./DOC_SCENE_1_zh.md)  
+**Dépôt :** https://github.com/williams73-oss/leju-competiton
 
 ---
 
-## 1. Objectif
+## 0. Quelqu’un peut-il cloner et lancer ?
 
-Pipeline orga : détecter 4 colis → saisir à droite → peser → regrasp → passer à gauche → déposer dans le bac.
+**Oui**, s’il a déjà l’environnement officiel challenge cup (image Docker / `kuavo_ws`).  
+Ce dépôt n’est **pas** toute la simu : c’est le **paquet tâche** `challenge_cup_task_template` (Scene1 + `robot_api` étendu) à installer dans le workspace.
 
-**Anti-triche :** le bras ne doit **jamais** être piloté par `/mujoco/qpos` ni `/ground_truth/state`.  
-`GT_COMPARE = False` en mission. Le GT MuJoCo sert uniquement au labo (CSV compare).
+Suivre **§1 De zéro**.
 
 ---
 
-## 2. Fichiers à connaître (ce dossier)
+## 1. De zéro (clone → install → run)
+
+### 1.1 Prérequis
+
+- Image / workspace officiel `kuavo_challenge_cup_2026` (comme un participant)
+- Savoir lancer la simu + `challenge_task.py` officiel
+- GPU / display comme l’orga
+
+### 1.2 Cloner
+
+```bash
+cd /tmp
+git clone https://github.com/williams73-oss/leju-competiton.git
+```
+
+Contenu utile :
+
+| Chemin | Rôle |
+|--------|------|
+| `scripts/challenge_task.py` | Entrée 3 scènes |
+| `scripts/scene1_task.py` | Entrée Scene1 |
+| `scripts/scene1/` | perception / actions / config |
+| `src/robot_api.py` | bras / pince (+ FK, IK 1 main, hold…) |
+| `src/perception_api.py` | cams + LiDAR + TF |
+
+### 1.3 Installer dans le workspace
+
+**A — Remplacer le paquet (recommandé)**
+
+```bash
+WS=~/leju-kuavo-challenge-cup-2026   # ou /root/kuavo_ws dans le conteneur
+PKG=$WS/src/challenge_cup_task_template
+
+mv "$PKG" "${PKG}.bak_$(date +%Y%m%d)"
+cp -a /tmp/leju-competiton "$PKG"
+```
+
+**B — Overlay Scene1 seulement**
+
+```bash
+PKG=~/leju-kuavo-challenge-cup-2026/src/challenge_cup_task_template
+SRC=/tmp/leju-competiton
+
+cp -a "$SRC/scripts/scene1" "$PKG/scripts/"
+cp -a "$SRC/scripts/scene1_task.py" "$PKG/scripts/"
+cp -a "$SRC/src/robot_api.py" "$PKG/src/"
+cp -a "$SRC/src/perception_api.py" "$PKG/src/"
+```
+
+Rebuilder le paquet si besoin (`catkin build challenge_cup_task_template`).
+
+### 1.4 Modes (`scripts/scene1/config.py`)
+
+| Réglage | Effet |
+|---------|--------|
+| `PERCEPTION_ONLY = True` | Detect only, pas de bras |
+| `TOUCH_TEST = True` | Detect puis toucher |
+| **les deux `False`** | **Mission complète** (défaut équipe) |
+
+Défaut actuel : mission (`False` / `False`), `FORCE_PARCEL_NAME = None` (4 colis).
+
+### 1.5 Lancer
+
+Dans l’env sourcé (conteneur ou host) :
+
+```bash
+source /root/kuavo_ws/devel/setup.zsh   # adapter le chemin
+rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 30
+```
+
+Changer `--seed` selon besoin (`0`, `30`, `400`…).
+
+### 1.6 Logs utiles
+
+```text
+DETECT | COLOR | FUSE | WRIST | VISION | Grabbed | DONE | claw
+```
+
+Succès type : `VISION OK`, `claw R=3` Grabbed, puis pesée / handoff.
+
+### 1.7 Optionnel — scripts Docker monorepo
+
+Si tu as le gros repo `leju-kuavo-challenge-cup-2026` **avec** `docker/run_scene1_*.sh` :
+
+```bash
+cd ~/leju-kuavo-challenge-cup-2026
+bash docker/stop_scene1.sh
+bash docker/run_scene1_mission.sh 30 900
+```
+
+Ces scripts **ne sont pas** dans `leju-competiton` sur GitHub. Sans eux → **`rosrun`** (§1.5).
+
+`Ctrl+C` n’arrête pas forcément Docker → `stop_scene1.sh` si dispo.
+
+**Ne pas pusher :** `labo/scene1/**` (csv, logs, images), gros CSV runtime.
+
+---
+
+## 2. Objectif
+
+Pipeline orga : 4 colis → droite → peser → regrasp → gauche → bac.
+
+**Anti-triche :** jamais piloter le bras avec `/mujoco/qpos` / GT.  
+`GT_COMPARE = False` en mission.
+
+---
+
+## 3. Fichiers
 
 | Fichier | Rôle |
 |---------|------|
 | `perception.py` | Tête : LiDAR + RGB LAB/HSV + depth → 4 colis |
-| `wrist_vision.py` | Main : blob couleur/depth + petit servo Δxy |
-| `config.py` | Modes, seuils, tip offset, WRIST_*, FORCE_PARCEL |
-| `actions.py` | Grasp / weigh / handoff (appelle la vision) |
-| `../scene1_task.py` | Entrée scène 1 |
-| `../../src/perception_api.py` | Cams `cam_h` / `cam_l` / `cam_r` + LiDAR + TF |
-
-**Ne pas push pour le travail runtime :** `labo/scene1/**` (csv, logs, reports), logs/CSV à la racine.
-
-Artefacts labo → `labo/scene1/` (voir `labo/scene1/README.md` à la racine du repo).
+| `wrist_vision.py` | Main : blob + petit Δxy |
+| `config.py` | Modes, seuils, WRIST_*, FORCE_PARCEL |
+| `actions.py` | Grasp / weigh / handoff |
+| `../scene1_task.py` | Entrée |
+| `../../src/perception_api.py` | Cams + LiDAR + TF |
+| `../../src/robot_api.py` | Bras / pince (+ API étendue) |
 
 ---
 
-## 3. Architecture (comment ça marche)
+## 4. Architecture
 
 ```
-1. HEAD  detect_parcels()
-   LiDAR clusters (OÙ) + couleur tête LAB/HSV (QUI) + depth
-   → fusion → grille relative 2×2
-   → [{name, color, center, source}, ...]
-
-2. APPROCHE bras droit au-dessus du centre détecté
-
-3. HAND  observe_hand() / refine_target_with_wrist()
-   Blob couleur+depth caméra poignet
-   Petit Δxy (max ~2 cm / pas, jusqu’à 4 itérations)
-   Gate : « see-check OK » avant de fermer
-
-4. GRASP  descente peu profonde + close
-   Tip shallow (éviter IK fail trop bas)
+HEAD detect → approche → HAND refine → GRASP close
 ```
 
-**Stratégie vision-first :** on fait confiance à la caméra main pour autoriser la fermeture (`WRIST_VISION_ONLY_GATE`, `WRIST_SKIP_CLAW_HOLD_CHECK`).  
-La simu dit souvent `REACHED` à ~88 % même pince vide — ne pas se fier au hold pour juger la vision.
+---
+
+## 5. Validé
+
+| Seed / colis | Résultat |
+|--------------|----------|
+| Seed **30**, `parcel_1` | VISION OK + Grabbed, pesée + handoff OK |
+| Seed **0** tête | 4/4, `err_structure_2x2 ≈ 0.009` m |
+| Seed 0, bleu / jaune | Approche OK ; grip / tip parfois à peaufiner |
 
 ---
 
-## 4. Ce qui a été validé
+## 6. Pièges & fixes
 
-| Seed / colis | Résultat vision / saisie |
-|--------------|---------------------------|
-| Seed **30**, `parcel_1` (gris/brun) | **Meilleur run** : VISION OK (frac≈0.10), `claw R=3` Grabbed, pesée + regrasp + handoff OK (`DONE 1/1`). |
-| Seed 0, `parcel_4` bleu | Au-dessus OK ; pince souvent vide (problème grip / tip, pas head detect). |
-| Seed 0 / 50, `parcel_2` jaune | Approche OK ; hold / tip séparés. |
-
-Détection tête multi-seed 0–3 (labo plus tôt) : 4/4, err structure ~0.2–3.7 cm — voir rapports dans `labo/scene1/reports/`.
-
----
-
-## 5. Problèmes rencontrés & solutions
-
-| Problème | Symptôme | Fix / leçon |
-|----------|----------|-------------|
-| Plongée trop profonde | `z≈-0.057` → IK fail après see-check → **jamais close** | Tip shallow : `RIGHT_PICK_IK_Z ≈ -0.005`, `RIGHT_CLAW_TIP_OFFSET ≈ [0.02, 0.01, -0.005]` ; `WRIST_CLOSE_EVEN_IF_IK_FAIL = True` |
-| Faux « holding » | `MOVING` + effort → croit tenir | `right_holding()` **ignore MOVING** |
-| Servo wrist trop agressif | Δxy 6–29 cm → diverge | `WRIST_MAX_DELTA_XY = 0.02`, gain 0.5, 4 iters max |
-| Yaw 0°/90° « axes carrés » | Dérègle le bras en pleine prise | **Retiré** ; `WRIST_YAW_ENABLE = False` ; garder `RIGHT_PICK_QUAT` orga fixe |
-| YOLO | Torch Docker trop vieux | Abandonné → LAB/HSV + LiDAR |
-| GT pour le bras | Anti-triche | Jamais ; `GT_COMPARE` labo only |
-
-**Idée gardée pour plus tard (pas en mid-grasp) :** orienter la pince parallèle / perpendiculaire aux bords du colis — sans yaw pendant le servo.
+| Problème | Fix |
+|----------|-----|
+| Plongée trop profonde → IK fail | Tip shallow (`RIGHT_PICK_IK_Z`, tip offset) |
+| Faux « holding » en MOVING | `right_holding()` ignore MOVING |
+| Servo wrist trop fort | `WRIST_MAX_DELTA_XY = 0.02`, 4 iters |
+| Yaw mid-grasp | `WRIST_YAW_ENABLE = False` |
+| Ancien `robot_api` | Remplacer par celui de ce dépôt |
 
 ---
 
-## 6. Config actuelle (points clés)
-
-Dans `config.py` (même dossier) :
+## 7. Config (aperçu)
 
 ```python
-PERCEPTION_ONLY = False   # False = mission complète
+PERCEPTION_ONLY = False
 TOUCH_TEST = False
-GT_COMPARE = False        # True seulement en labo CSV
-
-FORCE_PARCEL_NAME = "parcel_1"  # test unitaire ; None = tous les colis pour l’équipe
+GT_COMPARE = False
+FORCE_PARCEL_NAME = None
 
 RIGHT_CLAW_TIP_OFFSET = [0.02, 0.01, -0.005]
 RIGHT_PICK_IK_Z = -0.005
-
 WRIST_SERVO_ITERS = 4
 WRIST_MAX_DELTA_XY = 0.02
 WRIST_YAW_ENABLE = False
 WRIST_REQUIRE_SEE_BEFORE_CLOSE = True
 WRIST_VISION_ONLY_GATE = True
-WRIST_SKIP_CLAW_HOLD_CHECK = True   # focus vision ; le grip peut être ajusté par contrôle
 ```
-
-**Noms colis ↔ couleurs (approx.) :**
 
 | Name | Couleur |
 |------|---------|
@@ -119,83 +193,38 @@ WRIST_SKIP_CLAW_HOLD_CHECK = True   # focus vision ; le grip peut être ajusté 
 | `parcel_3` | orange |
 | `parcel_4` | bleu |
 
-Avant un push « pour toute l’équipe », envisager `FORCE_PARCEL_NAME = None`.
+---
+
+## 8. `robot_api` — APIs requises par `actions.py`
+
+Déjà dans `src/robot_api.py` de ce dépôt :
+
+| Méthode / import | Rôle |
+|------------------|------|
+| `_read_arm_joints_rad()` | 14 joints bras (capteurs) |
+| `call_fk()` | FK |
+| `solve_ik_one_hand()` | IK une main |
+| `_last_cmd_deg` | Dernière commande articulaire |
+| `right_holding()` / `describe_right()` | État pince droite |
+| `fkSrv`, `sensorsData` | Types ROS |
+
+Sans ce fichier → crash au grasp / handoff.
 
 ---
 
-## 7. Comment relancer (reproduire)
+## 9. Couches perception
 
-```bash
-cd ~/leju-kuavo-challenge-cup-2026
+1. LiDAR — OÙ  
+2. RGB tête LAB/HSV — QUI  
+3. Depth tête  
+4. Fusion + grille 2×2  
+5. Caméra poignet — refine avant close  
 
-# Toujours stopper avant un nouveau run
-bash docker/stop_scene1.sh
-
-# Mission complète (seed, timeout s)
-bash docker/run_scene1_mission.sh 30 900
-
-# Perception seule (pas de bras)
-# → PERCEPTION_ONLY = True dans config.py
-bash docker/run_scene1_local.sh
-
-# Multi-seed détection tête
-bash docker/run_scene1_multiseed_perception.sh 0 1 2 3
-```
-
-**Logs utiles :**
-
-```bash
-# Mission
-grep -E 'DETECT|COLOR|FUSE|WRIST|VISION|Grabbed|DONE|claw' scene1_mission_run.log
-
-# Perception only
-grep -E 'DETECT|COLOR|FUSE|REPORT|DONE' scene1_local_run.log
-```
-
-Succès vision saisie (exemple seed 30) : lignes du type `VISION OK`, `claw R=3`, Grabbed, puis pesée.  
-Une chute au handoff **ne remet pas en cause** la détection tête/main.
-
-**Ctrl+C** dans le terminal n’arrête pas Docker → utiliser `stop_scene1.sh`.
+Critères labo tête : `named == 4/4`, `err_structure_2x2 < 0.05` m, `colorish == 4`.
 
 ---
 
-## 8. Techniques / couches perception
+## 10. Liens
 
-1. **LiDAR** — OÙ (clusters XY table, grille 2×2 de secours)  
-2. **RGB tête (LAB/HSV)** — QUI (couleur → nom)  
-3. **Depth tête** — 3D caméra / ray  
-4. **Fusion** — associe couleur ↔ amas ; err_structure_2x2 = géométrie relative (pas seed0 absolu)  
-5. **Caméra poignet** — peaufinage local avant close (pas de gros sauts)
-
-Critères labo « détection OK » (tête) :
-
-1. `named == 4/4`  
-2. `err_structure_2x2 < 0.05` m  
-3. `colorish == 4`  
-4. landmarks `lm=2/2` (bonus)
-
----
-
-## 9. Qui fait quoi (recommandé)
-
-| Vision | Contrôle / mission |
-|--------|---------------------|
-| Qualité multi-seed, couleurs, wrist servo (frac ↓) | Hold réel, tip par couleur, handoff sans chute |
-| `perception.py`, `wrist_vision.py`, seuils `config` | `actions.py` (grip / passation / bac) |
-| Ne pas réintroduire GT → bras | Ne pas casser le gate vision sans raison |
-
----
-
-## 10. Prochaines pistes (vision)
-
-- Robustesse multi-seed sans `FORCE_PARCEL_NAME`  
-- Calibrer signes servo wrist (`WRIST_SERVO_SIGN_*`) pour que `frac` / Δpx **améliore** toujours  
-- Moins de faux blobs (ciel / doigts) — déjà filtrés par depth + ROI  
-- Yaw / axes carrés : seulement hors boucle de descente, si besoin
-
----
-
-## Liens
-
-- Labo artefacts : `labo/scene1/` (racine repo)  
-- Ancienne reprise 11–12 juil. : `docs/reprise_session/OU_JEN_ETAIS.md` (périmé pour la mission)
+- Dépôt équipe : https://github.com/williams73-oss/leju-competiton  
+- Réf. orga : `collect_scene1_handoff_dataset.py`
