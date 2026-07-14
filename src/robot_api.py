@@ -25,11 +25,11 @@ import rospy
 from geometry_msgs.msg import Twist
 from std_msgs.msg import String
 from sensor_msgs.msg import JointState
-from kuavo_msgs.srv import controlLejuClaw, changeArmCtrlMode, twoArmHandPoseCmdSrv
+from kuavo_msgs.srv import controlLejuClaw, changeArmCtrlMode, twoArmHandPoseCmdSrv, fkSrv
 from kuavo_msgs.msg import (lejuClawState, endEffectorData,
                             twoArmHandPoseCmd, twoArmHandPose,
                             armHandPose, ikSolveParam,
-                            robotHeadMotionData)
+                            robotHeadMotionData, sensorsData)
 
 
 # ============================================================
@@ -166,6 +166,7 @@ class ArmController:
 
     def __init__(self):
         self._pub = rospy.Publisher("/kuavo_arm_traj", JointState, queue_size=10)
+        self._last_cmd_deg = list(self.PRESETS["home"])
         rospy.sleep(0.1)
 
     # ---- 模式切换 ----
@@ -203,6 +204,7 @@ class ArmController:
         msg.name = self.JOINT_NAMES
         msg.position = list(positions)
         self._pub.publish(msg)
+        self._last_cmd_deg = [float(v) for v in positions]
 
     def go_home(self):
         """手臂回到初始位置（所有关节归零）。"""
@@ -224,7 +226,7 @@ class ArmController:
         if len(joints) != 7:
             rospy.logerr("left_arm_to 需要 7 个关节值")
             return
-        full = [0.0] * 14
+        full = list(self._last_cmd_deg) if len(self._last_cmd_deg) == 14 else [0.0] * 14
         full[0:7] = joints
         self.go_to_joints(full)
 
@@ -236,15 +238,117 @@ class ArmController:
         if len(joints) != 7:
             rospy.logerr("right_arm_to 需要 7 个关节值")
             return
-        full = [0.0] * 14
+        full = list(self._last_cmd_deg) if len(self._last_cmd_deg) == 14 else [0.0] * 14
         full[7:14] = joints
         self.go_to_joints(full)
+
+    # ---- Capteurs / FK / IK (orga collect_scene1) ----
+
+    def _read_arm_joints_rad(self, timeout=2.0):
+        """14 joints bras (rad) depuis /sensors_data_raw — orga `_read_current_arm_joints`."""
+        try:
+            msg = rospy.wait_for_message("/sensors_data_raw", sensorsData, timeout=timeout)
+        except Exception as exc:
+            rospy.logwarn("_read_arm_joints_rad: %s", exc)
+            return None
+        joint_q = list(msg.joint_data.joint_q)
+        if len(joint_q) >= 27:
+            return joint_q[13:27]
+        if len(joint_q) >= 26:
+            return joint_q[12:26]
+        raise RuntimeError("/sensors_data_raw joint_q has %d values" % len(joint_q))
+
+    def call_fk(self, joint_angles_rad, timeout=5.0):
+        """FK → hand_poses (left/right). joint_angles = 14 rad."""
+        rospy.wait_for_service("/ik/fk_srv", timeout=timeout)
+        resp = rospy.ServiceProxy("/ik/fk_srv", fkSrv)(list(joint_angles_rad))
+        if not resp.success:
+            rospy.logerr("/ik/fk_srv success=false")
+            return None
+        return resp.hand_poses
+
+    @staticmethod
+    def _ik_param(constraint_mode=None, pos_cost_weight=0.0, major_iterations_limit=500):
+        param = ikSolveParam()
+        param.major_optimality_tol = 1e-3
+        param.major_feasibility_tol = 1e-3
+        param.minor_feasibility_tol = 1e-3
+        param.major_iterations_limit = int(major_iterations_limit or 500)
+        param.oritation_constraint_tol = 1e-3
+        param.pos_constraint_tol = 1e-3
+        param.pos_cost_weight = float(pos_cost_weight or 0.0)
+        if constraint_mode is not None:
+            param.constraint_mode = int(constraint_mode)
+        return param
+
+    def solve_ik_one_hand(self, side, pos_xyz, quat_xyzw,
+                          constraint_mode=None, pos_cost_weight=0.0,
+                          major_iterations_limit=500, timeout=5.0):
+        """
+        IK une main (autre main figée joints courants) — orga `_call_one_hand_ik`.
+        Retourne (ok, q_arm_deg[14]).
+        """
+        import math
+        if side not in ("left", "right"):
+            raise ValueError("side must be left|right")
+        q0 = self._read_arm_joints_rad(timeout=timeout)
+        fk = self.call_fk(q0, timeout=timeout)
+        if fk is None:
+            return False, []
+
+        req = twoArmHandPoseCmd()
+        req.use_custom_ik_param = constraint_mode is not None
+        req.joint_angles_as_q0 = True
+        if req.use_custom_ik_param:
+            req.ik_param = self._ik_param(
+                constraint_mode, pos_cost_weight, major_iterations_limit)
+        req.hand_poses.left_pose.joint_angles = list(q0[:7])
+        req.hand_poses.right_pose.joint_angles = list(q0[7:])
+        req.hand_poses.left_pose.elbow_pos_xyz = [0.0, 0.0, 0.0]
+        req.hand_poses.right_pose.elbow_pos_xyz = [0.0, 0.0, 0.0]
+        req.hand_poses.left_pose.pos_xyz = list(fk.left_pose.pos_xyz)
+        req.hand_poses.left_pose.quat_xyzw = list(fk.left_pose.quat_xyzw)
+        req.hand_poses.right_pose.pos_xyz = list(fk.right_pose.pos_xyz)
+        req.hand_poses.right_pose.quat_xyzw = list(fk.right_pose.quat_xyzw)
+
+        target = req.hand_poses.left_pose if side == "left" else req.hand_poses.right_pose
+        if pos_xyz is not None:
+            target.pos_xyz = list(pos_xyz)
+        if quat_xyzw is not None:
+            target.quat_xyzw = list(quat_xyzw)
+
+        rospy.wait_for_service("/ik/two_arm_hand_pose_cmd_srv", timeout=timeout)
+        try:
+            resp = rospy.ServiceProxy("/ik/two_arm_hand_pose_cmd_srv", twoArmHandPoseCmdSrv)(req)
+        except rospy.ServiceException as e:
+            rospy.logerr("IK one-hand service failed: %s", e)
+            return False, []
+        if not resp.success:
+            rospy.logerr("IK one-hand fail: %s", getattr(resp, "error_reason", ""))
+            return False, []
+
+        q_rad = list(q0[:14])
+        if side == "left":
+            jr = list(resp.hand_poses.left_pose.joint_angles)
+            if len(jr) != 7 and len(resp.q_arm) >= 7:
+                jr = list(resp.q_arm[:7])
+            if len(jr) == 7:
+                q_rad = jr + q_rad[7:]
+        else:
+            jr = list(resp.hand_poses.right_pose.joint_angles)
+            if len(jr) != 7 and len(resp.q_arm) >= 14:
+                jr = list(resp.q_arm[7:14])
+            if len(jr) == 7:
+                q_rad = q_rad[:7] + jr
+        return True, [math.degrees(q) for q in q_rad]
 
     # ---- IK 求解 ----
 
     def solve_ik(self, left_pose_xyz, left_quat_xyzw,
                  right_pose_xyz, right_quat_xyzw,
-                 frame=2, use_current_as_q0=True):
+                 frame=2, use_current_as_q0=True,
+                 constraint_mode=None, pos_cost_weight=0.0,
+                 major_iterations_limit=500):
         """
         调用 IK 服务，输入双手末端位姿，返回 14 个关节角度。
 
@@ -255,40 +359,51 @@ class ArmController:
             right_quat_xyzw — 右手末端姿态 [x, y, z, w] 四元数
             frame           — 坐标系: 0=当前 1=odom 2=局部(默认) 3=VR 4=操作世界 5=关节空间
             use_current_as_q0 — 用当前关节角作为初值（通常 True）
+            constraint_mode / major_iterations_limit — params orga (custom IK)
 
         返回:
             (success, q_arm) — success 为 True 时 q_arm 是 14 个关节角度(度)
         """
+        import math
         rospy.wait_for_service("/ik/two_arm_hand_pose_cmd_srv", timeout=5.0)
         try:
             srv = rospy.ServiceProxy("/ik/two_arm_hand_pose_cmd_srv", twoArmHandPoseCmdSrv)
 
-            # 构建左右手姿态
+            q0 = None
+            if use_current_as_q0:
+                try:
+                    q0 = self._read_arm_joints_rad(timeout=2.0)
+                except Exception:
+                    q0 = None
+
             left_hp = armHandPose()
             left_hp.pos_xyz = list(left_pose_xyz)
             left_hp.quat_xyzw = list(left_quat_xyzw)
-
             right_hp = armHandPose()
             right_hp.pos_xyz = list(right_pose_xyz)
             right_hp.quat_xyzw = list(right_quat_xyzw)
+            if q0 is not None and len(q0) == 14:
+                left_hp.joint_angles = list(q0[:7])
+                right_hp.joint_angles = list(q0[7:])
 
-            # 构建双手位姿消息
             hand_poses = twoArmHandPose()
             hand_poses.left_pose = left_hp
             hand_poses.right_pose = right_hp
 
-            # 构建请求
             req = twoArmHandPoseCmd()
             req.hand_poses = hand_poses
             req.frame = frame
             req.joint_angles_as_q0 = use_current_as_q0
-            req.use_custom_ik_param = False  # 用默认 IK 参数即可
+            if constraint_mode is not None:
+                req.use_custom_ik_param = True
+                req.ik_param = self._ik_param(
+                    constraint_mode, pos_cost_weight, major_iterations_limit)
+            else:
+                req.use_custom_ik_param = False
 
             resp = srv(req)
 
             if resp.success:
-                # q_arm 是弧度，转为度
-                import math
                 q_deg = [math.degrees(q) for q in resp.q_arm]
                 rospy.loginfo("IK 求解成功，耗时 %.1f ms", resp.time_cost)
                 return True, q_deg
@@ -327,6 +442,10 @@ class ClawController:
         # 状态缓存（订阅 /leju_claw_state 更新）
         self._left_state = 0
         self._right_state = 0
+        self._left_pos = 0.0
+        self._right_pos = 0.0
+        self._left_effort = 0.0
+        self._right_effort = 0.0
         rospy.Subscriber("/leju_claw_state", lejuClawState, self._state_callback)
         rospy.sleep(0.1)
 
@@ -372,6 +491,30 @@ class ClawController:
         只要任一侧夹爪状态为 3 (Grabbed) 就返回 True。
         """
         return self._left_state == 3 or self._right_state == 3
+
+    def right_holding(self):
+        """True si la pince DROITE tient quelque chose (état + % ouverture)."""
+        # Pendant MOVING l'effort est trompeur → pas de hold
+        if self._right_state == 1:
+            return False
+        if self._right_state == 3:
+            return True
+        # Vide: pince atteinte ~90% fermée. Tenue: s'arrête avant.
+        if self._right_state == 2 and self._right_pos >= 85.0:
+            return False
+        if self._right_state == 2 and 25.0 <= self._right_pos <= 82.0:
+            return True
+        if abs(self._right_effort) > 0.15 and self._right_state != 1:
+            return True
+        return False
+
+    def describe_right(self):
+        names = {0: "UNKNOWN", 1: "MOVING", 2: "REACHED", 3: "GRABBED"}
+        return "R=%s pos=%.0f%% eff=%.2f hold=%s" % (
+            names.get(int(self._right_state), str(self._right_state)),
+            float(self._right_pos), float(self._right_effort),
+            self.right_holding(),
+        )
 
     def is_moving(self):
         """判断夹爪是否正在运动中（任一侧状态为 1）。"""
@@ -437,6 +580,19 @@ class ClawController:
         if len(msg.state) >= 2:
             self._left_state = msg.state[0]
             self._right_state = msg.state[1]
+        try:
+            data = getattr(msg, "data", None)
+            if data is not None:
+                pos = list(getattr(data, "position", []) or [])
+                eff = list(getattr(data, "effort", []) or [])
+                if len(pos) >= 2:
+                    self._left_pos = float(pos[0])
+                    self._right_pos = float(pos[1])
+                if len(eff) >= 2:
+                    self._left_effort = float(eff[0])
+                    self._right_effort = float(eff[1])
+        except Exception:
+            pass
 
 
 # ============================================================

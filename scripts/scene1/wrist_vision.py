@@ -32,7 +32,9 @@ from scene1.config import (  # noqa: E402
     LAB_COLOR_DIST_MAX,
     PARCEL_HSV_FALLBACK,
     PARCEL_REF_COLORS,
+    TABLE_LAB_DIST_MAX,
     TABLE_PARCEL_Z,
+    TABLE_REF_BGR,
     WRIST_ACCEPT_PX,
     WRIST_ALLOW_RAY,
     WRIST_CENTER_BIAS,
@@ -82,17 +84,24 @@ def _hsv_range_for_name(name):
     return None
 
 
+def _bgr_to_lab(ref_bgr):
+    swatch = np.uint8([[list(ref_bgr)]])
+    return cv2.cvtColor(swatch, cv2.COLOR_BGR2LAB)[0, 0].astype(np.float32)
+
+
 def _lab_mask(bgr, ref_bgr, dist_max):
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-    ref_u8 = np.uint8([[list(ref_bgr)]])
-    ref = cv2.cvtColor(ref_u8, cv2.COLOR_BGR2LAB)[0, 0].astype(np.float32)
+    ref = _bgr_to_lab(ref_bgr)
     dist = np.linalg.norm(lab - ref.reshape(1, 1, 3), axis=2)
-    return (dist < float(dist_max)).astype(np.uint8) * 255
+    return (dist < float(dist_max)).astype(np.uint8) * 255, dist
 
 
 def _hsv_mask(bgr, lo, hi):
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    return cv2.inRange(hsv, np.array(lo, dtype=np.uint8), np.array(hi, dtype=np.uint8))
+    # Poignet : S bas fréquent (ombres) → assouplir S min un peu
+    lo2 = [int(lo[0]), max(0, int(lo[1]) - 10), max(0, int(lo[2]) - 20)]
+    hi2 = [int(hi[0]), 255, 255]
+    return cv2.inRange(hsv, np.array(lo2, dtype=np.uint8), np.array(hi2, dtype=np.uint8))
 
 
 def _get_wrist_frames(cam, hand):
@@ -101,82 +110,172 @@ def _get_wrist_frames(cam, hand):
     return cam.get_right_wrist_rgb(), cam.get_right_wrist_depth(), "right"
 
 
-def _color_mask_for_target(bgr, name, depth=None):
-    """Masque couleur du colis ; optionnellement filtré par profondeur."""
+def _color_mask_for_target(bgr, name, depth=None, log=None):
+    """
+    Masque couleur poignet :
+      LAB (modéré) → soft seulement si vide → HSV si sparse → table →
+      si saturé (>20% image) resserrer LAB → depth soft.
+    """
     ref = _ref_bgr_for_name(name)
-    mask = None
-    if ref is not None:
-        dist = LAB_COLOR_DIST_BY_NAME.get(name, LAB_COLOR_DIST_MAX) + WRIST_LAB_BOOST
-        mask = _lab_mask(bgr, ref, dist)
-    hsv_rng = _hsv_range_for_name(name)
-    if hsv_rng is not None:
-        hm = _hsv_mask(bgr, hsv_rng[0], hsv_rng[1])
-        mask = hm if mask is None else cv2.bitwise_or(mask, hm)
-    if mask is None:
+    if ref is None:
         return None
 
-    # Depth gate : garde seulement pixels à distance plausible (main au-dessus table)
+    h, w = bgr.shape[:2]
+    img_n = float(max(h * w, 1))
+    sat_frac = float(globals().get("WRIST_MASK_SAT_FRAC", 0.20) or 0.20)
+
+    base = float(LAB_COLOR_DIST_BY_NAME.get(name, LAB_COLOR_DIST_MAX))
+    boost = float(globals().get("WRIST_LAB_BOOST", 14.0) or 14.0)
+    soft_extra = float(globals().get("WRIST_LAB_SOFT_EXTRA", 8.0) or 8.0)
+    thr = base + boost
+
+    mask, dist_map = _lab_mask(bgr, ref, thr)
+    n_lab = int(np.count_nonzero(mask))
+    dmin = float(dist_map.min()) if dist_map.size else 999.0
+
+    # Soft seulement si presque RIEN (évite area=260k)
+    if n_lab < int(WRIST_MIN_PIXELS):
+        thr2 = thr + soft_extra
+        mask2, _ = _lab_mask(bgr, ref, thr2)
+        n2 = int(np.count_nonzero(mask2))
+        if n2 > n_lab:
+            _log(log, "[HAND] %s LAB soft thr=%.0f→%.0f px %d→%d (dmin=%.1f)",
+                 name, thr, thr2, n_lab, n2, dmin)
+            mask, n_lab, thr = mask2, n2, thr2
+
+    # HSV : seulement pour sauver un masque trop maigre (pas pour le gorgé)
+    hsv_only_sparse = bool(globals().get("WRIST_HSV_ONLY_IF_SPARSE", True))
+    hsv_rng = _hsv_range_for_name(name)
+    if hsv_rng is not None:
+        if (not hsv_only_sparse) or n_lab < max(200, int(WRIST_MIN_PIXELS) * 3):
+            hm = _hsv_mask(bgr, hsv_rng[0], hsv_rng[1])
+            mask = cv2.bitwise_or(mask, hm)
+            n_lab = int(np.count_nonzero(mask))
+
+    # Exclude table — plus strict au poignet
+    if bool(globals().get("WRIST_USE_TABLE_EXCLUDE", True)):
+        lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+        table_lab = _bgr_to_lab(TABLE_REF_BGR)
+        table_dist = np.linalg.norm(lab - table_lab.reshape(1, 1, 3), axis=2)
+        scale = float(globals().get("WRIST_TABLE_EXCLUDE_SCALE", 1.15) or 1.15)
+        thr_table = float(TABLE_LAB_DIST_MAX) * scale
+        non_table = (table_dist > thr_table).astype(np.uint8) * 255
+        mask = cv2.bitwise_and(mask, non_table)
+
+    n_rgb = int(np.count_nonzero(mask))
+
+    # Saturation : resserrer LAB (log area≈260k)
+    if n_rgb / img_n > sat_frac:
+        thr_t = max(base + 4.0, thr - 12.0)
+        mask_t, _ = _lab_mask(bgr, ref, thr_t)
+        if bool(globals().get("WRIST_USE_TABLE_EXCLUDE", True)):
+            mask_t = cv2.bitwise_and(mask_t, non_table)
+        n_t = int(np.count_nonzero(mask_t))
+        if n_t >= int(WRIST_MIN_PIXELS):
+            _log(log, "[HAND] %s masque saturé %.0f%% → tighten thr=%.0f px %d→%d",
+                 name, 100.0 * n_rgb / img_n, thr_t, n_rgb, n_t)
+            mask, n_rgb, thr = mask_t, n_t, thr_t
+
+    # Depth soft
+    depth_soft = bool(globals().get("WRIST_DEPTH_SOFT", True))
     if depth is not None and depth.shape[:2] == mask.shape[:2]:
         d = depth.astype(np.float32)
         valid = np.isfinite(d) & (d >= float(WRIST_DEPTH_Z_MIN)) & (d <= float(WRIST_DEPTH_Z_MAX))
         if int(np.count_nonzero(valid)) > 200:
-            mask = mask.copy()
-            mask[~valid] = 0
+            masked = mask.copy()
+            masked[~valid] = 0
+            n_d = int(np.count_nonzero(masked))
+            if n_d >= max(int(WRIST_MIN_PIXELS), int(0.25 * max(n_rgb, 1))):
+                mask = masked
+            elif depth_soft and n_rgb >= int(WRIST_MIN_PIXELS):
+                _log(log, "[HAND] %s depth coupe %d→%d — garde RGB-only",
+                     name, n_rgb, n_d)
 
-    k = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+    k3 = np.ones((3, 3), np.uint8)
+    k5 = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k3)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k5)
+
+    n_final = int(np.count_nonzero(mask))
+    if n_final < int(WRIST_MIN_PIXELS):
+        _log(log, "[HAND] %s masque faible px=%d (LAB dmin=%.1f thr=%.0f)",
+             name, n_final, dmin, thr)
+    elif n_final / img_n > sat_frac:
+        _log(log, "[HAND] %s masque encore gros px=%d (%.0f%%)",
+             name, n_final, 100.0 * n_final / img_n)
     return mask
 
 
 def _image_aim(cam, cam_key, rgb_shape):
-    """Point visé = centre optique (sous la pince idéalement)."""
+    """
+    Point visé = projection tip pince (pas le centre optique brut).
+    Biais calibré logs seed30 : gros blob avec Δpx~200–240 = tip à côté.
+    """
     h, w = int(rgb_shape[0]), int(rgb_shape[1])
     info = cam.get_camera_info(cam_key) if cam is not None else None
     if info is not None:
-        return float(info["cx"]), float(info["cy"]), info
-    return 0.5 * w, 0.5 * h, None
+        cx = float(info["cx"])
+        cy = float(info["cy"])
+    else:
+        cx, cy = 0.5 * w, 0.5 * h
+        info = None
+    try:
+        from scene1.config import WRIST_AIM_BIAS_U, WRIST_AIM_BIAS_V
+        cx += float(WRIST_AIM_BIAS_U)
+        cy += float(WRIST_AIM_BIAS_V)
+    except Exception:
+        pass
+    cx = max(0.0, min(float(w - 1), cx))
+    cy = max(0.0, min(float(h - 1), cy))
+    return cx, cy, info
 
 
-def _best_blob_near_center(mask, min_px):
+def _best_blob_near_center(mask, min_px, aim_xy=None):
     """
-    Blob du colis sous la pince — pas le décor.
-    ROI centre + rejet blobs trop gros + bonus proximité centre.
+    Blob du colis pour la pince.
+    Cherche d'abord près du tip (aim), sinon meilleure tache dans toute l'image
+    (cas fréquent : bras arrêté À CÔTÉ du colis).
     """
     n, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
     if n <= 1:
         return None
     h, w = mask.shape[:2]
-    cx_i, cy_i = 0.5 * w, 0.5 * h
+    if aim_xy is not None:
+        cx_i, cy_i = float(aim_xy[0]), float(aim_xy[1])
+    else:
+        cx_i, cy_i = 0.5 * w, 0.5 * h
     img_area = float(max(h * w, 1))
     max_area = img_area * float(WRIST_MAX_BLOB_FRAC)
     roi = 0.5 * float(WRIST_ROI_FRAC)
     best_i, best_score = None, -1.0
 
-    for i in range(1, n):
+    def _score_blob(i, prefer_near):
         area = int(stats[i, cv2.CC_STAT_AREA])
         if area < min_px or area > max_area:
-            continue
+            return -1.0
         ux, uy = float(centroids[i][0]), float(centroids[i][1])
-        if abs(ux - cx_i) > roi * w or abs(uy - cy_i) > roi * h:
-            continue
+        if prefer_near:
+            if abs(ux - cx_i) > roi * w or abs(uy - cy_i) > roi * h:
+                return -1.0
         dist_n = math.hypot((ux - cx_i) / w, (uy - cy_i) / h)
-        size_term = min(float(area), 0.12 * img_area)
-        score = size_term * (1.0 - WRIST_CENTER_BIAS * min(1.0, dist_n * 2.5))
-        if score > best_score:
-            best_score = score
+        # Préférer taille colis réelle (~1–8% image), pas le décor saturé
+        ideal = 0.04 * img_area
+        size_term = float(area) * math.exp(-abs(math.log((area + 1.0) / ideal)) * 0.35)
+        size_term = min(size_term, 0.12 * img_area)
+        return size_term * (1.0 - WRIST_CENTER_BIAS * min(1.0, dist_n * 2.5))
+
+    for i in range(1, n):
+        sc = _score_blob(i, prefer_near=True)
+        if sc > best_score:
+            best_score = sc
             best_i = i
 
+    # Fallback : toute l'image, blob le plus près du tip (répare « à côté »)
     if best_i is None:
         for i in range(1, n):
-            area = int(stats[i, cv2.CC_STAT_AREA])
-            if area < min_px or area > max_area:
-                continue
-            ux, uy = float(centroids[i][0]), float(centroids[i][1])
-            dist_n = math.hypot((ux - cx_i) / w, (uy - cy_i) / h)
-            score = float(area) * (1.0 - 0.9 * min(1.0, dist_n * 2.0))
-            if score > best_score:
-                best_score = score
+            sc = _score_blob(i, prefer_near=False)
+            if sc > best_score:
+                best_score = sc
                 best_i = i
 
     if best_i is None:
@@ -267,22 +366,40 @@ def observe_hand(cam, target, hand="right", log=None, settle=None):
         _log(log, "[HAND] %s — pas d'image", name)
         return empty
 
-    mask = _color_mask_for_target(rgb, name, depth=depth)
+    cx_i, cy_i, _info = _image_aim(cam, cam_key, rgb.shape)
+    mask = _color_mask_for_target(rgb, name, depth=depth, log=log)
     if mask is None:
         _log(log, "[HAND] %s — pas de masque couleur", name)
         return empty
 
-    found = _best_blob_near_center(mask, WRIST_MIN_PIXELS)
+    found = _best_blob_near_center(mask, WRIST_MIN_PIXELS, aim_xy=(cx_i, cy_i))
     if found is None:
-        _log(log, "[HAND] %s — colis NON VU (couleur/depth)", name)
+        n_px = int(np.count_nonzero(mask))
+        _log(log, "[HAND] %s — colis NON VU (couleur, mask_px=%d)", name, n_px)
         return empty
 
     _blob, u_px, v_px, area = found
-    cx_i, cy_i, _info = _image_aim(cam, cam_key, rgb.shape)
     h, w = rgb.shape[:2]
     dpix = math.hypot(u_px - cx_i, v_px - cy_i)
     frac = dpix / max(math.hypot(w, h), 1.0)
-    centered = (dpix <= float(WRIST_ACCEPT_PX)) or (frac <= float(WRIST_CLOSE_MAX_PIXEL_FRAC))
+    # Seed30 fail-mode: area=78 Δpx=302 frac=0.21 → faux « CENTRÉ » (bruit)
+    from scene1.config import (
+        WRIST_LOCK_MIN_AREA as _LOCK_AREA,
+        WRIST_UNDER_HAND_AREA as _UH_AREA,
+        WRIST_UNDER_HAND_FRAC as _UH_FRAC,
+        WRIST_UNDER_HAND_MAX_DPIX as _UH_DPIX,
+    )
+    min_lock = float(_LOCK_AREA)
+    soft = float(WRIST_CLOSE_MAX_PIXEL_FRAC)
+    # Gate tip : pixels proches du aim — PAS soft-only (faux CENTRÉ loin du tip)
+    near = dpix <= float(WRIST_ACCEPT_PX)
+    # Gros blob + trop loin du tip → PAS lock (sinon close vide, log Δpx=239)
+    under_hand = (
+        area >= float(_UH_AREA)
+        and frac <= float(_UH_FRAC)
+        and dpix <= float(_UH_DPIX)
+    )
+    centered = bool((near and area >= min_lock and frac <= soft) or under_hand)
 
     yaw_raw = 0.0
     yaw_snap = 0.0
@@ -407,7 +524,8 @@ def refine_target_with_wrist(cam, tf_reader, target, hand="right", log=None,
         out["wrist_seen"] = False
         return out
 
-    raw = target.get("center_raw") or target.get("center")
+    # Pose courante (après grille/tête), PAS center_raw UV seule — sinon saute ailleurs
+    raw = target.get("center") or target.get("center_raw")
     ox, oy, oz = float(raw[0]), float(raw[1]), float(raw[2])
 
     if obs["centered"]:

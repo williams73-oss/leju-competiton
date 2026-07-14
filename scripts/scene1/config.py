@@ -13,8 +13,14 @@ import math
 #   TOUCH_TEST      : perception puis toucher (équipe contrôle)
 #   (les deux False) : mission complète saisie / balance / bac
 # =============================================================================
-PERCEPTION_ONLY = False  # True = perception only ; False = mission (saisie orga-flow, prêt)
+PERCEPTION_ONLY = False  # False = mission saisie (seed0 test)
 TOUCH_TEST = False
+# Backend détection colis :
+#   "lidar"     = pipeline équipe (LiDAR + couleur + fuse) — défaut
+#   "graphics"  = essai ych adapté (src/scene3_task.py) — abandonné seed0 (2/4, err 0.25)
+PERCEPTION_BACKEND = "lidar"
+DEBUG_STOP_IK_LABEL = ""  # ex. "right_x_to_pick_pre" = debug arrêt IK
+DEBUG_STOP_AFTER_FIRST_IK = False
 # Mission orga-flow : déjà câblé dans actions.py (grasp→weigh→handoff→box).
 # Anti-triche : XY colis = detect_parcels ; points fixes scène = constantes orga.
 
@@ -29,7 +35,7 @@ HEAD_SETTLE_SEC = 0.8       # comme orga
 # N'alimente JAMAIS le bras / la mission — log + CSV baseline seulement.
 # Artefacts → labo/scene1/ (pas la racine repo / pas le code constructeur)
 LABO_SCENE1_REL = "labo/scene1"
-GT_COMPARE = False  # True = labo only (jamais en mission — pas de GT)
+GT_COMPARE = False  # False en mission
 GT_COMPARE_CSV = "labo/scene1/csv/scene1_gt_compare_fix_xbias.csv"
 STUDY_GT_CSV = "labo/scene1/csv/scene1_study_gt_mujoco.csv"
 STUDY_DET_CSV = "labo/scene1/csv/scene1_study_det_fix_xbias.csv"
@@ -96,11 +102,19 @@ PARCEL_WORLD_POS = {
     "parcel_3": (-0.11, -0.31, 0.880),
     "parcel_4": (-0.11, -0.09, 0.880),
 }
-TABLE_X_RANGE = (0.20, 0.55)     # colis IK x ≈ 0.31 … 0.46
-TABLE_Y_RANGE = (-0.38, -0.05)   # évite amas parasites y≈-0.42 (chute touch)
-PARCEL_Z_RANGE = (-0.20, 0.25)   # centre colis IK z ≈ -0.04 (world 0.88 − offset)
-PARCEL_RGB_Z_RANGE = (-0.12, 0.05)  # rgb-ray/depth : table z≈-0.04 ; rejette z≈+0.2
-TABLE_PARCEL_Z = -0.04           # hauteur saisie (RIGHT_PICK_IK_Z ≈ -0.03)
+TABLE_X_RANGE = (0.18, 0.58)     # seed30 : x≈0.25–0.48 (IK fail sous 0.18)
+TABLE_Y_RANGE = (-0.42, 0.00)     # zone table seed30
+PARCEL_Z_RANGE = (-0.15, 0.12)   # rejette amas flottants z≈0.22
+PARCEL_RGB_Z_RANGE = (-0.12, 0.05)
+TABLE_PARCEL_Z = -0.04
+MIN_PICK_IK_X = 0.22               # sous ça : IK / workspace KO
+
+# Contrat tête = ZONE stable (LiDAR←couleur UV).
+# Labo seeds 0–9 : grid OFF → err_structure bloqué à 0.12 m (jaune sur colonne droite).
+# grid-x ON + Δ max 18 cm : corrige association gauche ; row-lift reste OFF (bras/touch).
+FUSE_ENABLE_GRID_SNAP = True
+FUSE_ENABLE_ROW_LIFT = False
+FUSE_MAX_RESHAPE_XY = 0.18         # jaune mal collé ~15 cm → 4 cm skippait toujours le snap
 MAX_COLOR_AREA_RATIO = 0.18      # rejette masque > 18 % ROI (faux bleu ciel)
 COLOR_ROI_V_START = 0.08         # pitch=20 : colis dès ~v=0.60 (plus haut qu'avec look_down)
 COLOR_TABLE_BAND_V0 = 0.10       # fraction haute du ROI ignorée
@@ -129,7 +143,7 @@ LAB_COLOR_DIST_BY_NAME = {
     "parcel_2": 78.0,              # jaune pâle (sim souvent saturée basse)
     "parcel_1": 72.0,
     "parcel_3": 85.0,              # FOCUS orange : plus tolérant
-    "parcel_4": 58.0,              # bleu : depth-gate coupe le ciel
+    "parcel_4": 66.0,              # bleu : 58 trop strict → colorish=3 (seeds 1/4/7)
 }
 MAX_FUSE_UV_DIST = 0.28            # pitch=20 : proj. relative + marge
 
@@ -212,8 +226,10 @@ LEFT_PRESET_2_IK = [0.313, 0.239, 0.282]       # main gauche en attente
 RIGHT_HANDOFF_IK = [0.246, -0.044645, 0.3016983]  # point de passation
 RIGHT_HANDOFF_TRANSIT_Z = 0.40     # hauteur intermédiaire avant passation
 RIGHT_HANDOFF_TRANSIT_FALLBACK_ZS = [0.37, 0.35]  # orga: si 0.40 IK fail
-LEFT_HANDOFF_RECEIVE_XZ_READY_IK = [0.266, 0.139, 0.2216983]  # orga: align XZ avant Y
-LEFT_HANDOFF_RECEIVE_IK = [0.266, 0.04645, 0.2216983]  # main gauche reçoit
+# Gauche : même 1er YPR que droite ; 2e YPR = miroir (yaw/roll signés, pitch identique)
+# pour coïncidence des pinces avant lâcher (orga avait pitch G=0 vs D=-20 → désaligné).
+LEFT_HANDOFF_RECEIVE_XZ_READY_IK = [0.266, 0.139, 0.2816983]  # z aligné ~droite
+LEFT_HANDOFF_RECEIVE_IK = [0.266, 0.04645, 0.2816983]
 RIGHT_HANDOFF_RETRACT_Y = -0.30    # recul de la main droite après passation
 BOX_DROP_BASE_IK = [0.58, 0.24, 0.556217]   # xy plus centré sur ouverture bac
 BOX_DROP_HOVER_Z = 0.66            # au-dessus, assez bas pour viser le trou (sans toucher)
@@ -256,13 +272,24 @@ GRIPPER_SETTLE_TIME = 0.4           # pause après ouverture/fermeture pince
 WEIGH_RELEASE_SETTLE = 1.5          # stabilisation avant ouverture sur balance
 WEIGH_DWELL = 1.0                   # attente après pose (simulation pesée)
 PLACE_DWELL = 1.0                   # laisser le colis tomber dans le bac
-MAX_PARCELS = 1
-MAX_MISSION_FAILURES = 5
-FORCE_PARCEL_NAME = "parcel_1"      # gris/brun — test seed 30
+MAX_PARCELS = 4
+MAX_MISSION_FAILURES = 8
+FORCE_PARCEL_NAME = None            # None = les 4 colis (brun→jaune→orange→bleu selon score)
 
 # Pipeline : prise → pesée → handoff → bac (mode validé)
 TRAIN_PICK_BOX = False
 SKIP_WEIGH = False
+# False = orga : droite pèse → passation → gauche dépose bac.
+SKIP_HANDOFF = False
+# Cibles lab (unused si SKIP_HANDOFF=False)
+RIGHT_BOX_DROP_BASE_IK = [0.52, 0.12, 0.556217]
+RIGHT_BOX_DROP_HOVER_Z = 0.62
+RIGHT_BOX_DROP_TRANSIT_Z = 0.40
+RIGHT_BOX_DROP_IK_Y_TRIES = [0.0, 0.04, -0.04, 0.08, 0.12]
+RIGHT_BOX_DROP_IK_X_TRIES = [0.0, -0.04, 0.04, -0.08, 0.06]
+# Pause coïncidence : gauches fermée + angles alignés, avant ouverture droite
+HANDOFF_COINCIDENCE_SETTLE = 0.8
+HANDOFF_BOTH_HOLD_BEFORE_OPEN_R = 0.5
 
 # Vérif saisie (LiDAR/RGB après lift) — Phase 1B : abort si encore sur table.
 # /mujoco/qpos est INTERDIT (anti-triche).
@@ -344,25 +371,24 @@ def _quat_from_ypr_deg(first_ypr_deg, second_ypr_deg=None):
 
 # Quaternions pré-calculés pour chaque phase du mouvement (évite de recalculer à chaque fois)
 LEFT_PRESET_2_QUAT = _quat_from_ypr_deg([-146.440, 4.966, 0.0], [0.0, 0.0, 96.580])
-RIGHT_PICK_QUAT = _quat_from_ypr_deg([0, -90, 0.0], [90.0, 0.0, 0.0])  # prise table (orga fixe)
+RIGHT_PICK_QUAT = _quat_from_ypr_deg([0, -90, 0.0], [90.0, 0.0, 0.0])  # prise // axes table
+# Grippage perpendiculaire (colis carré tourné ~90°) — yaw verrouillé avant plongée
+RIGHT_PICK_QUAT_AXIS90 = _quat_from_ypr_deg([0, -90, 0.0], [90.0, 0.0, 90.0])
 RIGHT_WEIGH_RELEASE_QUAT = _quat_from_ypr_deg([0, -100, 0.0], [90.0, 0.0, 0.0])
 RIGHT_WEIGH_REGRASP_QUAT = _quat_from_ypr_deg([0, -60, 0.0], [90.0, 0.0, 0.0])
 RIGHT_HANDOFF_QUAT = _quat_from_ypr_deg([-0.839, -100.0, 0.0], [90.0, -20.0, 90.0])
-LEFT_HANDOFF_RECEIVE_QUAT = _quat_from_ypr_deg([-0.839, -100.0, 0.0], [-90.0, -0.0, -90.0])
+# Miroir de la droite : same first YPR, second = [-yaw, pitch, -roll]
+LEFT_HANDOFF_RECEIVE_QUAT = _quat_from_ypr_deg([-0.839, -100.0, 0.0], [-90.0, -20.0, -90.0])
 LEFT_BOX_DROP_QUAT = _quat_from_ypr_deg([-0.328, -100.935, 0.0], [-90.0, 0.0, 0.369])
 
-# Offset tip : shallow — si déjà au-dessus, petite descente suffit (IK fail à z=-0.057)
+# Offset tip — DOC XY ; Z un peu plus bas (VISION OK Δpx=49 mais pince vide)
 RIGHT_CLAW_TIP_OFFSET = [0.02, 0.01, -0.005]
-RIGHT_PICK_IK_Z = -0.005            # peu profond = IK fiable + close
+RIGHT_PICK_IK_Z = -0.025
 RIGHT_PICK_TRANSIT_IK_Z = 0.22
 RIGHT_PICK_NEAR_FAR_Y_THRESHOLD = -0.20
 RIGHT_PICK_OFFSET_FAR_ROW = [-0.02, 0.0, -0.01]
 RIGHT_PICK_OFFSET_NEAR_ROW = [-0.02, 0.02, -0.01]
-RIGHT_PICK_OFFSET_BY_PARCEL = {
-    "parcel_4": [-0.01, 0.015, -0.01],  # bleu
-    "parcel_2": [-0.015, 0.02, -0.01],  # jaune
-    "parcel_3": [-0.02, 0.01, -0.01],
-}
+RIGHT_PICK_OFFSET_BY_PARCEL = {}
 RIGHT_PICK_YZ_ALIGN_SAFE_IK_X = 0.184
 # Modes IK orga (pas de triche — paramètres de solve)
 IK_MODE_POS_HARD_ORI_SOFT = 0x02
@@ -395,31 +421,46 @@ ARM_CLEAR_TABLE_Z = 0.28   # hauteur mini avant tout déplacement horizontal
 # Pince (Grabbed) = après, une fois la vision stable
 # =============================================================================
 WRIST_ALLOW_RAY = True
-WRIST_DEPTH_Z_MIN = 0.08           # filtre depth : trop près = doigts/bruit
-WRIST_DEPTH_Z_MAX = 0.55           # trop loin = pas le colis sous la main
+WRIST_DEPTH_Z_MIN = 0.08
+WRIST_DEPTH_Z_MAX = 0.55
 WRIST_MIN_PIXELS = 50
-WRIST_MAX_BLOB_FRAC = 0.25         # rejet masque saturé
-WRIST_ROI_FRAC = 0.75              # cherche dans 75% centre (tête a placé la zone)
-WRIST_MAX_DELTA_XY = 0.02          # 2 cm max / pas (vision fine, pas de saut)
-WRIST_SERVO_GAIN = 0.50
-WRIST_SERVO_ITERS = 4              # boucle regards → petit move → regard
+# Log saturé area≈260k → faux centroid ; viser blobs colis (~15–80k)
+WRIST_MAX_BLOB_FRAC = 0.16
+WRIST_MASK_SAT_FRAC = 0.20         # si masque > 20% image → resserrer LAB
+WRIST_ROI_FRAC = 0.85
+WRIST_MAX_DELTA_XY = 0.02
+WRIST_SERVO_GAIN = 0.45
+WRIST_SERVO_ITERS = 4
 WRIST_SERVO_SIGN_X = 1.0
 WRIST_SERVO_SIGN_Y = -1.0
 WRIST_CENTER_BIAS = 0.85
-WRIST_ACCEPT_PX = 24.0             # Δpx sous ça = CENTRÉ
-WRIST_LAB_BOOST = 10.0
-WRIST_SETTLE = 0.30
-WRIST_YAW_ENABLE = False           # OFF — yaw pince dérègle le bras ; mission = détection
+WRIST_ACCEPT_PX = 90.0
+# Sweet spot run CENTRÉ Δpx=49 area≈40k
+WRIST_LAB_BOOST = 8.0
+WRIST_LAB_SOFT_EXTRA = 8.0
+WRIST_USE_TABLE_EXCLUDE = True
+WRIST_TABLE_EXCLUDE_SCALE = 1.15   # plus strict que tête (évite table « brun »)
+WRIST_DEPTH_SOFT = True
+WRIST_HSV_ONLY_IF_SPARSE = True    # HSV n'élargit pas un masque déjà plein
+WRIST_SETTLE = 0.35
+# Yaw // faces du colis carré : 1 mesure au-dessus → snap 0/90 → quat figé (pas en servo)
+WRIST_YAW_ENABLE = True
 WRIST_YAW_MAX_DEG = 90.0
-WRIST_YAW_SNAP_SQUARE = False
+WRIST_YAW_SNAP_SQUARE = True
 WRIST_REQUIRE_SEE_BEFORE_CLOSE = True
-WRIST_CLOSE_MAX_PIXEL_FRAC = 0.22  # strict : vision doit être bonne avant close
+WRIST_CLOSE_MAX_PIXEL_FRAC = 0.10
+WRIST_LOCK_MIN_AREA = 3000
+WRIST_UNDER_HAND_AREA = 12000
+WRIST_UNDER_HAND_FRAC = 0.12
+WRIST_UNDER_HAND_MAX_DPIX = 120
+WRIST_POST_PLUNGE_MAX_DPIX = 170   # post-plongée Δpx monte (parallaxe tip)
+WRIST_AIM_BIAS_U = 40.0
+WRIST_AIM_BIAS_V = 70.0
 WRIST_APPROACH_NUDGE = True
 WRIST_APPROACH_NUDGE_MAX = 0.02
-WRIST_SHALLOW_PLUNGE = 0.045
+WRIST_SHALLOW_PLUNGE = 0.05
 WRIST_CLOSE_EVEN_IF_IK_FAIL = True
 WRIST_MID_DESCEND = False
-# Vision-first : ne pas bloquer sur claw tant que la vision n'est pas validée
-WRIST_VISION_ONLY_GATE = True      # abort si main ne voit pas ; claw check assoupli après
-WRIST_SKIP_CLAW_HOLD_CHECK = True  # focus vision : close même si sim dit REACHED vide
+WRIST_VISION_ONLY_GATE = True
+WRIST_SKIP_CLAW_HOLD_CHECK = False
 

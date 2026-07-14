@@ -909,20 +909,63 @@ def _fuse_color_names_to_lidar(color_hits, lidar_clusters, log):
         color_hits,
         key=lambda ch: 0 if ch.get("center_base") is not None else 1)
 
+    x_mid = float(globals().get("LIDAR_GRID_X_MID", 0.381))
+    y_mid = float(globals().get("LIDAR_GRID_Y_MID", -0.214))
+
+    def _fuse_cost(ch, li):
+        u, v = _lidar_norm_uv(lidar_clusters[li], xs, ys)
+        d = math.hypot(ch["u_norm"] - u, ch["v_norm"] - v)
+        cx, cy, _ = lidar_clusters[li]["center"]
+        cb = ch.get("center_base")
+        if cb is not None:
+            # XY caméra pèse plus que UV relatif (head20: UV plantait
+            # jaune/bleu sur la rangée basse → Δxy ~19 cm).
+            d = 0.30 * d + 0.70 * math.hypot(cx - cb[0], cy - cb[1]) / 0.25
+        # Colonne : parcel_1/2 = gauche, parcel_3/4 = droite.
+        name = ch["name"]
+        if name in ("parcel_1", "parcel_2") and cx > x_mid + 0.02:
+            d += 0.85
+        elif name in ("parcel_3", "parcel_4") and cx < x_mid - 0.02:
+            d += 0.85
+        # Rangée : parcel_1/3 = y bas (loin), parcel_2/4 = y haut (proche).
+        # Seed4 : orange↔bleu swapaient sans ça.
+        if name in ("parcel_1", "parcel_3") and cy > y_mid + 0.02:
+            d += 0.85
+        elif name in ("parcel_2", "parcel_4") and cy < y_mid - 0.02:
+            d += 0.85
+        return d
+
     for ch in ordered:
         name = ch["name"]
         if name not in PARCEL_NAMES or name in matched_names:
             continue
-        best_li, best_d = None, float("inf")
+        # Préférer bonne colonne ET bonne rangée
+        prefer = []
         for li in remaining:
-            u, v = _lidar_norm_uv(lidar_clusters[li], xs, ys)
-            d = math.hypot(ch["u_norm"] - u, ch["v_norm"] - v)
-            cb = ch.get("center_base")
-            if cb is not None:
-                cx, cy, _ = lidar_clusters[li]["center"]
-                # XY caméra pèse plus que UV relatif (head20: UV plantait
-                # jaune/bleu sur la rangée basse → Δxy ~19 cm).
-                d = 0.30 * d + 0.70 * math.hypot(cx - cb[0], cy - cb[1]) / 0.25
+            cx, cy = lidar_clusters[li]["center"][0], lidar_clusters[li]["center"][1]
+            col_ok = True
+            row_ok = True
+            if name in ("parcel_1", "parcel_2"):
+                col_ok = cx <= x_mid + 0.02
+            elif name in ("parcel_3", "parcel_4"):
+                col_ok = cx >= x_mid - 0.02
+            if name in ("parcel_1", "parcel_3"):
+                row_ok = cy <= y_mid + 0.02
+            elif name in ("parcel_2", "parcel_4"):
+                row_ok = cy >= y_mid - 0.02
+            if col_ok and row_ok:
+                prefer.append(li)
+        if not prefer:
+            for li in remaining:
+                cx = lidar_clusters[li]["center"][0]
+                if name in ("parcel_1", "parcel_2") and cx <= x_mid + 0.02:
+                    prefer.append(li)
+                elif name in ("parcel_3", "parcel_4") and cx >= x_mid - 0.02:
+                    prefer.append(li)
+        candidates = prefer if prefer else remaining
+        best_li, best_d = None, float("inf")
+        for li in candidates:
+            d = _fuse_cost(ch, li)
             if d < best_d:
                 best_d, best_li = d, li
         if best_li is None or best_d > MAX_FUSE_UV_DIST + 0.15:
@@ -942,6 +985,90 @@ def _fuse_color_names_to_lidar(color_hits, lidar_clusters, log):
             name, ch["color"], cx, cy, cz, best_d)
 
     return fused, used_lidar
+
+
+def _fix_row_structure(parcels, log):
+    """
+    1) Si orange est sur la rangée haute et bleu en bas → swap centres (seed4).
+    2) Aligne Y droite sur voisins gauche (1↔3, 2↔4).
+    3) Si rangée haute trop collée à la basse (|y2-y1|<0.14) → écarte de row_dy.
+    """
+    by_name = {p["name"]: p for p in parcels if p["name"] in PARCEL_NAMES}
+    p1 = by_name.get("parcel_1")
+    p2 = by_name.get("parcel_2")
+    p3 = by_name.get("parcel_3")
+    p4 = by_name.get("parcel_4")
+    if p1 is None or p2 is None:
+        return parcels
+
+    y1, y2 = p1["center"][1], p2["center"][1]
+    # s'assurer brown plus bas (plus négatif) que yellow
+    if y1 > y2 + 0.05:
+        log("[FUSE] row-fix: swap parcel_1↔parcel_2 (y inversés)")
+        c1, c2 = p1["center"], p2["center"]
+        p1["center"], p2["center"] = (c1[0], c2[1], c1[2]), (c2[0], c1[1], c2[2])
+        y1, y2 = p1["center"][1], p2["center"][1]
+
+    if p3 is not None and p4 is not None:
+        y3, y4 = p3["center"][1], p4["center"][1]
+        d3_lo = abs(y3 - y1)
+        d3_hi = abs(y3 - y2)
+        # Orange trop proche de la rangée jaune → swap avec bleu
+        if d3_hi + 0.04 < d3_lo:
+            log("[FUSE] row-fix: swap parcel_3↔parcel_4 "
+                "(orange y=%.3f sur rangée haute)", y3)
+            c3, c4 = p3["center"], p4["center"]
+            p3["center"], p4["center"] = c4, c3
+            p3["source"] = (p3.get("source") or "?") + "+row-swap"
+            p4["source"] = (p4.get("source") or "?") + "+row-swap"
+            y3, y4 = p3["center"][1], p4["center"][1]
+
+        # Snap Y voisins horizontaux (max 12 cm)
+        for left_p, right_p, tag in ((p1, p3, "brown←orange"), (p2, p4, "yellow←blue")):
+            if left_p is None or right_p is None:
+                continue
+            ly, ry = left_p["center"][1], right_p["center"][1]
+            if 0.02 < abs(ly - ry) <= 0.12:
+                rx, _, rz = right_p["center"]
+                if "center_raw" not in right_p:
+                    right_p["center_raw"] = right_p["center"]
+                right_p["center"] = (rx, ly, rz)
+                right_p["source"] = (right_p.get("source") or "?") + "+row-y"
+                log("[FUSE] row-fix %s: y %.3f → %.3f", tag, ry, ly)
+
+    # Écarter rangée haute si collapse (jaune trop proche marron)
+    _, row_dy = _grid_spacing()
+    y1, y2 = p1["center"][1], p2["center"][1]
+    gap = y2 - y1  # doit être ~+0.21
+    if gap < 0.16:
+        target_y2 = y1 + row_dy
+        max_d = float(globals().get("FUSE_MAX_RESHAPE_XY", 0.18) or 0.18)
+        if abs(target_y2 - y2) <= max_d + 0.05:
+            for name, target_y in (("parcel_2", target_y2),):
+                p = by_name.get(name)
+                if p is None:
+                    continue
+                cx, cy, cz = p["center"]
+                if "center_raw" not in p:
+                    p["center_raw"] = (cx, cy, cz)
+                p["center"] = (cx, target_y, cz)
+                p["source"] = (p.get("source") or "?") + "+row-gap"
+                log("[FUSE] row-fix %s: y %.3f → %.3f (gap bas→haut)",
+                    name, cy, target_y)
+            p4 = by_name.get("parcel_4")
+            p2 = by_name.get("parcel_2")
+            if p4 is not None and p2 is not None:
+                cx, cy, cz = p4["center"]
+                ty = p2["center"][1]
+                if abs(cy - ty) > 0.02:
+                    if "center_raw" not in p4:
+                        p4["center_raw"] = (cx, cy, cz)
+                    p4["center"] = (cx, ty, cz)
+                    p4["source"] = (p4.get("source") or "?") + "+row-gap"
+                    log("[FUSE] row-fix parcel_4: y %.3f → %.3f (suit jaune)",
+                        cy, ty)
+
+    return _sort_parcels(list(by_name.values()))
 
 
 def _inject_rgb_parcels(parcels, color_hits, log):
@@ -1007,6 +1134,9 @@ def _fix_collapsed_high_row(parcels, color_hits, log):
     Si jaune/bleu n'ont pas clairement la rangée haute, reprendre Y RGB
     ou +row_dy. Ne lifter QUE si la rangée basse est crédible (anti-chute).
     """
+    if not bool(globals().get("FUSE_ENABLE_ROW_LIFT", True)):
+        log("[FUSE] row-lift OFF (contrat zone stable)")
+        return parcels
     by_name = {p["name"]: dict(p) for p in parcels if p["name"] in PARCEL_NAMES}
     if len(by_name) < 2:
         return parcels
@@ -1216,6 +1346,9 @@ def _snap_grid_geometry(parcels, log):
     Contrainte 2×2 scene1 : colonne droite LiDAR fiable → corrige X colonne gauche.
     Même logique pour Y entre voisins de rangée (parcel_1↔3, parcel_2↔4).
     """
+    if not bool(globals().get("FUSE_ENABLE_GRID_SNAP", True)):
+        log("[FUSE] grid-snap OFF (contrat zone stable — LiDAR←couleur)")
+        return parcels
     by_name = {p["name"]: p for p in parcels if p["name"] in PARCEL_NAMES}
     if len(by_name) < 2:
         return parcels
@@ -1285,6 +1418,11 @@ def _snap_grid_geometry(parcels, log):
             # Ne pas tirer hors table
             if left_x < TABLE_X_RANGE[0] - 0.01:
                 log("[FUSE] skip grid-x %s: left_x=%.3f hors table", name, left_x)
+                continue
+            max_d = float(globals().get("FUSE_MAX_RESHAPE_XY", 0.04) or 0.04)
+            if abs(cx - left_x) > max_d:
+                log("[FUSE] skip grid-x %s: Δx=%.3f > %.3f (garde mesure)",
+                    name, abs(cx - left_x), max_d)
                 continue
             # Garder la pose LiDAR réelle pour la saisie/touch (évite viser le vide)
             if "center_raw" not in p:
@@ -1368,7 +1506,7 @@ def _snap_grid_geometry(parcels, log):
                     "depuis %s",
                     p2["name"], left_x, py4, TABLE_PARCEL_Z, "parcel_4")
 
-    return _sort_parcels(list(by_name.values()))
+    return _fix_row_structure(_sort_parcels(list(by_name.values())), log)
 
 
 def _name_clusters_spatial(lidar_clusters, log):
@@ -1487,17 +1625,68 @@ def _fuse_lidar_and_color(lidar_clusters, color_hits, log):
         log("[FUSE] 未匹配颜色的簇 → parcel_unknown_%d @ (%.3f, %.3f, %.3f)",
             i + 1, cx, cy, cz)
 
-    # Renommer les unknown restants via spatial, puis inject couleur fiable
+    # Renommer les unknown restants : grille fixe (pas mid d'1 seul amas).
+    # Si le slot est déjà pris par un match médiocre → swap (seed0 mission :
+    # amas brun 0.40/-0.34 jeté car spatial montrait blue alors UV avait déjà blue).
     named_ok = [p for p in fused if p["name"] in PARCEL_NAMES]
     unknowns = [p for p in fused if p["name"] not in PARCEL_NAMES]
     if unknowns:
-        spatial = _name_clusters_spatial(unknowns, log)
-        have = {p["name"] for p in named_ok}
-        for p in spatial:
-            if p["name"] not in have:
+        x_mid = float(globals().get("LIDAR_GRID_X_MID", 0.381))
+        y_mid = float(globals().get("LIDAR_GRID_Y_MID", -0.214))
+
+        def _slot_cost(name, cx, cy):
+            sx = x_mid - 0.07 if name in ("parcel_1", "parcel_2") else x_mid + 0.07
+            sy = y_mid - 0.10 if name in ("parcel_1", "parcel_3") else y_mid + 0.10
+            return math.hypot(cx - sx, cy - sy)
+
+        by_name = {p["name"]: p for p in named_ok}
+        for lc in unknowns:
+            cx, cy, cz = lc["center"]
+            preferred = _slot_name_from_xy(cx, cy, x_mid, y_mid)
+            p = dict(lc)
+            p["color"] = _color_label_for_parcel(preferred)
+            p["source"] = "lidar-spatial+reassign"
+            if preferred not in by_name:
+                p["name"] = preferred
                 named_ok.append(p)
-                have.add(p["name"])
-        fused = named_ok
+                by_name[preferred] = p
+                log("[FUSE] unknown → %s @ (%.3f, %.3f, %.3f)",
+                    preferred, cx, cy, cz)
+                continue
+            old = by_name[preferred]
+            ox, oy = old["center"][0], old["center"][1]
+            if _slot_cost(preferred, cx, cy) + 0.04 < _slot_cost(preferred, ox, oy):
+                free = [n for n in PARCEL_NAMES if n not in by_name]
+                # libérer preferred : déplacer l'ancien vers le meilleur free
+                displaced = dict(old)
+                if free:
+                    best_f = min(free, key=lambda n: _slot_cost(n, ox, oy))
+                    displaced["name"] = best_f
+                    displaced["color"] = _color_label_for_parcel(best_f)
+                    displaced["source"] = (displaced.get("source") or "?") + "+displaced"
+                    by_name[best_f] = displaced
+                    log("[FUSE] displace %s → %s (%.3f, %.3f) au profit unknown",
+                        preferred, best_f, ox, oy)
+                named_ok = [q for q in named_ok if q["name"] != preferred]
+                if free:
+                    named_ok.append(displaced)
+                p["name"] = preferred
+                named_ok.append(p)
+                by_name[preferred] = p
+                log("[FUSE] unknown remplace %s @ (%.3f, %.3f) ← (%.3f, %.3f)",
+                    preferred, cx, cy, ox, oy)
+            else:
+                free = [n for n in PARCEL_NAMES if n not in by_name]
+                if not free:
+                    continue
+                best_f = min(free, key=lambda n: _slot_cost(n, cx, cy))
+                p["name"] = best_f
+                p["color"] = _color_label_for_parcel(best_f)
+                named_ok.append(p)
+                by_name[best_f] = p
+                log("[FUSE] unknown slot %s pris → %s @ (%.3f, %.3f)",
+                    preferred, best_f, cx, cy)
+        fused = _sort_parcels(named_ok)
 
     fused = _inject_rgb_parcels(fused, color_hits, log)
     fused = _snap_row_x_from_lidar_neighbors(fused, log)
@@ -1508,7 +1697,32 @@ def detect_parcels(lidar, cam, tf_reader, log):
     """
     Point d'entrée perception : enchaîne LiDAR → RGB+depth → fusion.
     Retourne une liste de dicts : {name, color, center, size_xy, n_points}.
+
+    Si PERCEPTION_BACKEND=graphics : pipeline ych adaptée (src/scene3_task.py).
     """
+    backend = str(globals().get("PERCEPTION_BACKEND", "lidar") or "lidar").lower()
+    if backend in ("graphics", "ych", "scene3"):
+        log("[DETECT] backend=graphics (ych depth→cluster→couleur)")
+        repo = _repo_root()
+        src_dir = os.path.join(repo, "src")
+        if src_dir not in sys.path:
+            sys.path.insert(0, src_dir)
+        try:
+            import scene3_task as ych_geo
+            parcels = ych_geo.detect_parcels_graphics(cam, tf_reader, log)
+        except Exception as exc:
+            log("[DETECT] graphics échoué: %s — fallback lidar", exc)
+            parcels = []
+        if parcels:
+            for p in parcels:
+                cx, cy, cz = p["center"]
+                log("[DETECT] 最终 %s (%s) [%s]: center=(%.3f, %.3f, %.3f)",
+                    p["name"], p.get("color", "?"), p.get("source", "?"),
+                    cx, cy, cz)
+            log("[DETECT] graphics terminé，共 %d 个快递", len(parcels))
+            return parcels
+        log("[DETECT] graphics vide → fallback lidar+couleur")
+
     lidar.wait_for_points(timeout=3.0, min_points=50)
     cam.wait_for_frame("head_rgb", timeout=2.0)
     cam.wait_for_frame("head_depth", timeout=2.0)
