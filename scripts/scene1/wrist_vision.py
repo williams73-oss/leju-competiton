@@ -16,9 +16,11 @@ Outils utilisés :
 """
 from __future__ import print_function
 
+import json
 import math
 import os
 import sys
+import time
 
 import numpy as np
 import rospy
@@ -28,6 +30,11 @@ if _scripts not in sys.path:
     sys.path.insert(0, _scripts)
 
 from scene1.config import (  # noqa: E402
+    GRASP_AIM_CENTER_DPIX,
+    GRASP_AIM_EDGE_DPIX,
+    GRASP_HOLD_POS_EMPTY_MIN,
+    GRASP_HOLD_POS_GOOD_MAX,
+    GRASP_HOLD_POS_GOOD_MIN,
     LAB_COLOR_DIST_BY_NAME,
     LAB_COLOR_DIST_MAX,
     PARCEL_HSV_FALLBACK,
@@ -42,6 +49,8 @@ from scene1.config import (  # noqa: E402
     WRIST_DEPTH_Z_MAX,
     WRIST_DEPTH_Z_MIN,
     WRIST_LAB_BOOST,
+    WRIST_LOG_ENABLED,
+    WRIST_LOG_PATH,
     WRIST_MAX_BLOB_FRAC,
     WRIST_MAX_DELTA_XY,
     WRIST_MIN_PIXELS,
@@ -67,8 +76,215 @@ def _log(log, msg, *args):
 
 
 # ---------------------------------------------------------------------------
-# Couleur / frames
+# Logs JSONL + jugement milieu / bord / vide
 # ---------------------------------------------------------------------------
+
+def _seed_hint():
+    for key in ("SCENE1_SEED", "KUAVO_SEED", "seed"):
+        v = os.environ.get(key, "").strip()
+        if v != "":
+            try:
+                return int(v)
+            except Exception:
+                return v
+    try:
+        if rospy.core.is_initialized():
+            return int(rospy.get_param("/challenge_cup/seed", -1))
+    except Exception:
+        pass
+    return None
+
+
+def wrist_log_path():
+    env = os.environ.get("SCENE1_WRIST_LOG", "").strip()
+    if env in ("0", "false", "False", "off", "OFF"):
+        return None
+    if env:
+        return env
+    cfg = (WRIST_LOG_PATH or "").strip()
+    if cfg:
+        return cfg
+    home = os.environ.get("HOME") or os.path.expanduser("~") or "/tmp"
+    return os.path.join(home, "scene1_wrist.jsonl")
+
+
+def log_wrist_event(event, log=None, **fields):
+    """
+    Append 1 ligne JSON (analyse offline).
+    Désactiver : WRIST_LOG_ENABLED=False ou SCENE1_WRIST_LOG=0
+    """
+    if not WRIST_LOG_ENABLED:
+        return
+    path = wrist_log_path()
+    if path is None:
+        return
+    row = {
+        "ts": time.time(),
+        "event": str(event),
+        "seed": _seed_hint(),
+    }
+    for k, v in fields.items():
+        if v is None:
+            continue
+        if isinstance(v, (bool, int, float, str)):
+            row[k] = v
+        elif isinstance(v, (list, tuple)) and len(v) <= 8:
+            try:
+                row[k] = [float(x) for x in v]
+            except Exception:
+                row[k] = str(v)
+        else:
+            try:
+                row[k] = float(v)
+            except Exception:
+                row[k] = str(v)
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            try:
+                os.makedirs(parent, exist_ok=True)
+            except TypeError:
+                if not os.path.isdir(parent):
+                    os.makedirs(parent)
+        with open(path, "a") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        _log(log, "[HAND] log skip: %s", exc)
+
+
+def classify_aim(obs):
+    """
+    Où on vise sur le colis (caméra poignet) :
+      unseen | center | edge | off
+
+    Priorité : tip dans le cœur du blob (face) > Δpx seul.
+    """
+    if not obs or not obs.get("seen"):
+        return "unseen"
+    zone = obs.get("grip_zone")
+    if zone == "center":
+        return "center"
+    if zone == "edge":
+        return "edge"
+    if zone == "outside":
+        return "off"
+    dpix = float(obs.get("dpix", 1e9))
+    if obs.get("centered") or dpix <= float(GRASP_AIM_CENTER_DPIX):
+        return "center"
+    if dpix <= float(GRASP_AIM_EDGE_DPIX):
+        return "edge"
+    return "off"
+
+
+def classify_hold(claw_pos=None, claw_state=None, holding=None):
+    """
+    Comment la pince serre (ouverture %) :
+      empty | good | thin_edge | wide_edge | unknown
+    - empty     : fermé à fond (pas d'objet)
+    - good      : épaisseur plausible boîte carrée
+    - thin_edge : peu ouvert (coin / tip / mauvais contact)
+    - wide_edge : assez ouvert mais hors fenêtre (bord oblique / 2 objets)
+    """
+    if holding is False and claw_state not in (3,):
+        if claw_pos is not None and float(claw_pos) >= float(GRASP_HOLD_POS_EMPTY_MIN):
+            return "empty"
+    if claw_state == 3 or holding is True:
+        if claw_pos is None:
+            return "good"
+        p = float(claw_pos)
+        if p >= float(GRASP_HOLD_POS_EMPTY_MIN):
+            return "empty"
+        if float(GRASP_HOLD_POS_GOOD_MIN) <= p <= float(GRASP_HOLD_POS_GOOD_MAX):
+            return "good"
+        if p < float(GRASP_HOLD_POS_GOOD_MIN):
+            return "thin_edge"
+        return "wide_edge"
+    if claw_pos is not None:
+        p = float(claw_pos)
+        if p >= float(GRASP_HOLD_POS_EMPTY_MIN):
+            return "empty"
+        if float(GRASP_HOLD_POS_GOOD_MIN) <= p <= float(GRASP_HOLD_POS_GOOD_MAX):
+            return "good"
+        if p < float(GRASP_HOLD_POS_GOOD_MIN):
+            return "thin_edge"
+        return "wide_edge"
+    return "unknown"
+
+
+def assess_grasp_manner(obs=None, claw_pos=None, claw_state=None, holding=None):
+    """
+    Combine aim (caméra) + hold (pince) → manner + ok_for_weigh.
+
+    manners :
+      center_good  — vise milieu + épaisseur OK
+      edge_hold    — tient mais vise bord / épaisseur bizarre
+      empty        — ne tient pas
+      unseen_hold  — tient sans avoir vu (suspect)
+      unknown
+    """
+    aim = classify_aim(obs)
+    hold = classify_hold(claw_pos, claw_state, holding)
+    if hold == "empty":
+        manner = "empty"
+        ok = False
+    elif aim == "center" and hold == "good":
+        manner = "center_good"
+        ok = True
+    elif hold in ("good", "thin_edge", "wide_edge") and aim in ("edge", "off"):
+        manner = "edge_hold"
+        ok = False  # recovery plutôt que pesée aveugle
+    elif hold in ("good", "thin_edge", "wide_edge") and aim == "unseen":
+        manner = "unseen_hold"
+        ok = False
+    elif hold == "good":
+        manner = "center_good"
+        ok = True
+    else:
+        manner = "unknown"
+        ok = bool(holding) and aim == "center"
+    return {
+        "aim": aim,
+        "hold": hold,
+        "manner": manner,
+        "ok_for_weigh": ok,
+        "dpix": float(obs.get("dpix", -1)) if obs else -1.0,
+        "frac": float(obs.get("frac", -1)) if obs else -1.0,
+        "area": int(obs.get("area", 0)) if obs else 0,
+        "claw_pos": None if claw_pos is None else float(claw_pos),
+        "claw_state": claw_state,
+        "holding": holding,
+    }
+
+
+def is_excellent_grasp(obs=None, assess=None, claw_state=None, claw_pos=None,
+                       holding=None, vision_locked=False):
+    """
+    Très bonne prise (1er essai typique) :
+      - vision OK avant close (centré / zone center)
+      - pince Grabbed + épaisseur plausible (hold=good)
+    → une fois True, ne jamais rouvrir pour recovery.
+    """
+    if assess is None:
+        assess = {}
+    if not (holding or int(claw_state or -1) == 3):
+        return False
+    if assess.get("hold") == "empty":
+        return False
+    if claw_pos is not None and float(claw_pos) >= float(GRASP_HOLD_POS_EMPTY_MIN):
+        return False
+    if assess.get("manner") == "center_good":
+        return True
+    if assess.get("hold") == "good":
+        if vision_locked:
+            return True
+        if obs and (
+            obs.get("centered")
+            or obs.get("grip_zone") == "center"
+            or obs.get("tip_in_core")
+        ):
+            return True
+    return False
+
 
 def _ref_bgr_for_name(name):
     for n, _label, bgr in PARCEL_REF_COLORS:
@@ -125,7 +341,11 @@ def _color_mask_for_target(bgr, name, depth=None, log=None):
     sat_frac = float(globals().get("WRIST_MASK_SAT_FRAC", 0.20) or 0.20)
 
     base = float(LAB_COLOR_DIST_BY_NAME.get(name, LAB_COLOR_DIST_MAX))
-    boost = float(globals().get("WRIST_LAB_BOOST", 14.0) or 14.0)
+    boost_map = globals().get("WRIST_LAB_BOOST_BY_NAME") or {}
+    if isinstance(boost_map, dict) and name in boost_map:
+        boost = float(boost_map[name])
+    else:
+        boost = float(globals().get("WRIST_LAB_BOOST", 14.0) or 14.0)
     soft_extra = float(globals().get("WRIST_LAB_SOFT_EXTRA", 8.0) or 8.0)
     thr = base + boost
 
@@ -204,6 +424,83 @@ def _color_mask_for_target(bgr, name, depth=None, log=None):
         _log(log, "[HAND] %s masque encore gros px=%d (%.0f%%)",
              name, n_final, 100.0 * n_final / img_n)
     return mask
+
+
+def _blob_grip_geometry(blob, aim_xy):
+    """
+    Tip vs face du colis (blob) :
+      grip_zone = center | edge | outside
+      tip_in_core, tip_in_blob, half_diag, tip_rel (0=centre, 1=bord)
+    """
+    h, w = blob.shape[:2]
+    ax, ay = float(aim_xy[0]), float(aim_xy[1])
+    ys, xs = np.where(blob > 0)
+    empty = {
+        "grip_zone": "outside",
+        "tip_in_core": False,
+        "tip_in_blob": False,
+        "half_diag": 1.0,
+        "tip_rel": 1.0,
+        "aspect": 1.0,
+        "bbox": (0, 0, 0, 0),
+    }
+    if len(xs) < 20:
+        return empty
+
+    u0, v0 = float(xs.mean()), float(ys.mean())
+    x_min, x_max = int(xs.min()), int(xs.max())
+    y_min, y_max = int(ys.min()), int(ys.max())
+    bw = max(1, x_max - x_min + 1)
+    bh = max(1, y_max - y_min + 1)
+    aspect = float(max(bw, bh)) / float(min(bw, bh))
+    half_diag = 0.5 * math.hypot(float(bw), float(bh))
+    tip_dist = math.hypot(ax - u0, ay - v0)
+    tip_rel = tip_dist / max(half_diag, 1.0)
+
+    ix = int(round(ax))
+    iy = int(round(ay))
+    tip_in_blob = bool(0 <= ix < w and 0 <= iy < h and blob[iy, ix] > 0)
+
+    erode_k = int(globals().get("WRIST_CORE_ERODE", 7) or 7)
+    if erode_k % 2 == 0:
+        erode_k += 1
+    erode_k = max(3, erode_k)
+    kernel = np.ones((erode_k, erode_k), np.uint8)
+    core = cv2.erode(blob, kernel, iterations=1)
+    if int(np.count_nonzero(core)) < 40:
+        # blob petit → cœur = moitié intérieure via distance transform
+        core = blob.copy()
+        tip_in_core = tip_in_blob and tip_rel <= 0.45
+    else:
+        tip_in_core = bool(0 <= ix < w and 0 <= iy < h and core[iy, ix] > 0)
+
+    if tip_in_core:
+        zone = "center"
+    elif tip_in_blob or tip_rel <= 0.85:
+        zone = "edge"
+    else:
+        zone = "outside"
+
+    return {
+        "grip_zone": zone,
+        "tip_in_core": bool(tip_in_core),
+        "tip_in_blob": bool(tip_in_blob),
+        "half_diag": float(half_diag),
+        "tip_rel": float(tip_rel),
+        "aspect": float(aspect),
+        "bbox": (x_min, y_min, bw, bh),
+        "centroid": (u0, v0),
+    }
+
+
+def _yaw_confident(area, aspect):
+    if bool(globals().get("WRIST_YAW_ENABLE", False)):
+        return True
+    if not bool(globals().get("WRIST_YAW_AUTO", True)):
+        return False
+    min_a = float(globals().get("WRIST_YAW_MIN_AREA", 8000) or 8000)
+    max_asp = float(globals().get("WRIST_YAW_MAX_ASPECT", 1.55) or 1.55)
+    return area >= min_a and aspect <= max_asp
 
 
 def _image_aim(cam, cam_key, rgb_shape):
@@ -348,11 +645,14 @@ def observe_hand(cam, target, hand="right", log=None, settle=None):
         "name": target.get("name", "?") if target else "?",
     }
     if cam is None or not _HAS_CV2 or target is None:
+        log_wrist_event("observe", log=log, seen=False, aim="unseen", reason="no_cam")
         return empty
 
     name = target.get("name", "?")
     empty["name"] = name
     if name not in ("parcel_1", "parcel_2", "parcel_3", "parcel_4"):
+        log_wrist_event("observe", log=log, name=name, seen=False, aim="unseen",
+                        reason="bad_name")
         return empty
 
     rgb_key = "right_rgb" if hand != "left" else "left_rgb"
@@ -364,18 +664,24 @@ def observe_hand(cam, target, hand="right", log=None, settle=None):
     rgb, depth, cam_key = _get_wrist_frames(cam, hand)
     if rgb is None:
         _log(log, "[HAND] %s — pas d'image", name)
+        log_wrist_event("observe", log=log, name=name, hand=hand, seen=False,
+                        aim="unseen", reason="no_rgb")
         return empty
 
     cx_i, cy_i, _info = _image_aim(cam, cam_key, rgb.shape)
     mask = _color_mask_for_target(rgb, name, depth=depth, log=log)
     if mask is None:
         _log(log, "[HAND] %s — pas de masque couleur", name)
+        log_wrist_event("observe", log=log, name=name, hand=hand, seen=False,
+                        aim="unseen", reason="no_mask")
         return empty
 
     found = _best_blob_near_center(mask, WRIST_MIN_PIXELS, aim_xy=(cx_i, cy_i))
     if found is None:
         n_px = int(np.count_nonzero(mask))
         _log(log, "[HAND] %s — colis NON VU (couleur, mask_px=%d)", name, n_px)
+        log_wrist_event("observe", log=log, name=name, hand=hand, seen=False,
+                        aim="unseen", reason="no_blob", mask_px=int(n_px))
         return empty
 
     _blob, u_px, v_px, area = found
@@ -399,21 +705,33 @@ def observe_hand(cam, target, hand="right", log=None, settle=None):
         and frac <= float(_UH_FRAC)
         and dpix <= float(_UH_DPIX)
     )
-    centered = bool((near and area >= min_lock and frac <= soft) or under_hand)
+    geom = _blob_grip_geometry(_blob, (cx_i, cy_i))
+    tip_core_req = bool(globals().get("WRIST_TIP_IN_CORE_REQUIRED", True))
+    near_ok = bool((near and area >= min_lock and frac <= soft) or under_hand)
+    if tip_core_req:
+        centered = bool(near_ok and geom.get("tip_in_core"))
+        # tip dans blob mais pas cœur → pas encore lock (servo continue)
+        if near_ok and geom.get("tip_in_blob") and not geom.get("tip_in_core"):
+            centered = False
+    else:
+        centered = near_ok
 
     yaw_raw = 0.0
     yaw_snap = 0.0
     square_axis = 0
-    if WRIST_YAW_ENABLE:
+    do_yaw = _yaw_confident(area, float(geom.get("aspect", 99.0)))
+    if do_yaw and (WRIST_YAW_ENABLE or bool(globals().get("WRIST_YAW_AUTO", True))):
         yaw_raw = _blob_principal_yaw_deg(_blob)
         yaw_snap = snap_yaw_to_square_deg(yaw_raw) if WRIST_YAW_SNAP_SQUARE else yaw_raw
         square_axis = square_axis_from_yaw(yaw_snap)
 
-    _log(log, "[HAND] %s VU area=%d Δpx=%.0f frac=%.2f yaw=%+.0f→%+.0f° axis=%d → %s",
-         name, area, dpix, frac, yaw_raw, yaw_snap, square_axis,
+    _log(log, "[HAND] %s VU area=%d Δpx=%.0f frac=%.2f zone=%s tip_rel=%.2f "
+         "yaw=%+.0f→%+.0f° axis=%d → %s",
+         name, area, dpix, frac, geom.get("grip_zone"), geom.get("tip_rel", 1.0),
+         yaw_raw, yaw_snap, square_axis,
          "CENTRÉ" if centered else "décalé")
 
-    return {
+    out = {
         "seen": True,
         "centered": centered,
         "u": u_px,
@@ -431,7 +749,33 @@ def observe_hand(cam, target, hand="right", log=None, settle=None):
         "yaw_deg": yaw_snap,
         "yaw_raw_deg": yaw_raw,
         "square_axis": square_axis,
+        "grip_zone": geom.get("grip_zone"),
+        "tip_in_core": geom.get("tip_in_core"),
+        "tip_in_blob": geom.get("tip_in_blob"),
+        "tip_rel": geom.get("tip_rel"),
+        "aspect": geom.get("aspect"),
     }
+    aim = classify_aim(out)
+    out["aim"] = aim
+    log_wrist_event(
+        "observe",
+        log=log,
+        name=name,
+        hand=hand,
+        seen=True,
+        centered=bool(centered),
+        aim=aim,
+        grip_zone=str(geom.get("grip_zone")),
+        tip_in_core=bool(geom.get("tip_in_core")),
+        tip_rel=float(geom.get("tip_rel", 1.0)),
+        area=int(area),
+        dpix=float(dpix),
+        frac=float(frac),
+        u=float(u_px),
+        v=float(v_px),
+        yaw_deg=float(yaw_snap),
+    )
+    return out
 
 
 def wrist_sees_centered(cam, tf_reader, target, hand="right", log=None):
@@ -522,32 +866,86 @@ def refine_target_with_wrist(cam, tf_reader, target, hand="right", log=None,
         out = dict(target)
         out["wrist_refined"] = False
         out["wrist_seen"] = False
+        log_wrist_event("refine", log=log, name=name, refined=False, seen=False,
+                        aim="unseen")
         return out
 
     # Pose courante (après grille/tête), PAS center_raw UV seule — sinon saute ailleurs
     raw = target.get("center") or target.get("center_raw")
     ox, oy, oz = float(raw[0]), float(raw[1]), float(raw[2])
 
+    # Depth 3D : centroid blob → base_link (plus précis que ray table seul)
+    depth3d = None
+    depth_m = None
+    blob = obs.get("blob")
+    depth = obs.get("depth")
+    if (bool(globals().get("WRIST_USE_DEPTH_3D", True))
+            and blob is not None and depth is not None
+            and hasattr(cam, "median_depth_in_mask")
+            and hasattr(cam, "pixel_to_base_link")):
+        zmin = float(globals().get("WRIST_DEPTH_Z_GRASP_MIN", 0.06) or 0.06)
+        zmax = float(globals().get("WRIST_DEPTH_Z_GRASP_MAX", 0.45) or 0.45)
+        depth_m = cam.median_depth_in_mask(depth, blob, z_min=zmin, z_max=zmax)
+        if depth_m is not None:
+            depth3d = cam.pixel_to_base_link(
+                tf_reader, obs["cam_key"], obs["u"], obs["v"], depth_m)
+            if depth3d is not None:
+                _log(log, "[HAND] %s depth3d z_cam=%.3f → (%.3f,%.3f,%.3f)",
+                     name, depth_m, depth3d[0], depth3d[1], depth3d[2])
+
     if obs["centered"]:
         out = dict(target)
+        if depth3d is not None:
+            max_d = float(globals().get("WRIST_DEPTH_3D_MAX_DELTA", 0.04) or 0.04)
+            dx = float(depth3d[0]) - ox
+            dy = float(depth3d[1]) - oy
+            if math.hypot(dx, dy) <= max_d:
+                out["center"] = (float(depth3d[0]), float(depth3d[1]), float(oz))
+                out["center_raw"] = out["center"]
+                out["wrist_source"] = "hand-centered-depth3d"
+            else:
+                out["wrist_source"] = "hand-centered"
+        else:
+            out["wrist_source"] = "hand-centered"
         out["wrist_refined"] = True
         out["wrist_seen"] = True
         out["wrist_centered"] = True
-        out["wrist_source"] = "hand-centered"
         out["wrist_delta_xy"] = 0.0
         out["wrist_frac"] = obs["frac"]
         out["wrist_area"] = obs["area"]
+        out["aim"] = obs.get("aim", classify_aim(obs))
+        out["grip_zone"] = obs.get("grip_zone")
+        log_wrist_event(
+            "refine", log=log, name=name, refined=True, seen=True,
+            centered=True, aim=out["aim"], grip_zone=obs.get("grip_zone"),
+            delta_xy=0.0, depth_m=depth_m,
+            area=int(obs["area"]), dpix=float(obs["dpix"]), frac=float(obs["frac"]),
+        )
         return out
 
-    servo, dxy_servo = _servo_delta_xy(
-        cam, tf_reader, obs["cam_key"], obs["u"], obs["v"], obs["rgb"].shape, log)
-    if servo is None:
-        out = dict(target)
-        out["wrist_refined"] = False
-        out["wrist_seen"] = True
-        return out
+    # Prefer depth3d delta when available; else ray servo
+    dx = dy = 0.0
+    dxy_servo = 0.0
+    source = "hand-servo"
+    if depth3d is not None:
+        dx = float(depth3d[0]) - ox
+        dy = float(depth3d[1]) - oy
+        dxy_servo = math.hypot(dx, dy)
+        source = "hand-depth3d"
+        _log(log, "[HAND] %s depth3d Δxy=(%+.1f,%+.1f)cm",
+             name, dx * 100.0, dy * 100.0)
+    else:
+        servo, dxy_servo = _servo_delta_xy(
+            cam, tf_reader, obs["cam_key"], obs["u"], obs["v"], obs["rgb"].shape, log)
+        if servo is None:
+            out = dict(target)
+            out["wrist_refined"] = False
+            out["wrist_seen"] = True
+            log_wrist_event("refine", log=log, name=name, refined=False, seen=True,
+                            aim=obs.get("aim", classify_aim(obs)), reason="no_servo")
+            return out
+        dx, dy = servo
 
-    dx, dy = servo
     if dxy_servo > clamp:
         scale = clamp / max(dxy_servo, 1e-6)
         dx *= scale
@@ -557,8 +955,8 @@ def refine_target_with_wrist(cam, tf_reader, target, hand="right", log=None,
 
     nx, ny = ox + dx, oy + dy
     nz = float(TABLE_PARCEL_Z)
-    _log(log, "[HAND] %s APPLY Δxy=%.1fcm area=%d → (%.3f,%.3f)",
-         name, dxy_servo * 100.0, obs["area"], nx, ny)
+    _log(log, "[HAND] %s APPLY Δxy=%.1fcm area=%d zone=%s → (%.3f,%.3f) [%s]",
+         name, dxy_servo * 100.0, obs["area"], obs.get("grip_zone"), nx, ny, source)
 
     out = dict(target)
     out["center_raw"] = (nx, ny, nz)
@@ -566,10 +964,19 @@ def refine_target_with_wrist(cam, tf_reader, target, hand="right", log=None,
     out["wrist_refined"] = True
     out["wrist_seen"] = True
     out["wrist_centered"] = False
-    out["wrist_source"] = "hand-servo"
+    out["wrist_source"] = source
     out["wrist_delta_xy"] = dxy_servo
     out["wrist_frac"] = obs["frac"]
     out["wrist_area"] = obs["area"]
+    out["aim"] = obs.get("aim", classify_aim(obs))
+    out["grip_zone"] = obs.get("grip_zone")
+    log_wrist_event(
+        "refine", log=log, name=name, refined=True, seen=True, centered=False,
+        aim=out["aim"], grip_zone=obs.get("grip_zone"),
+        delta_xy=float(dxy_servo), depth_m=depth_m, source=source,
+        area=int(obs["area"]), dpix=float(obs["dpix"]), frac=float(obs["frac"]),
+        center=(nx, ny, nz),
+    )
     return out
 
 

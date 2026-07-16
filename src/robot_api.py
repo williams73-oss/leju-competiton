@@ -260,6 +260,9 @@ class ArmController:
 
     def call_fk(self, joint_angles_rad, timeout=5.0):
         """FK → hand_poses (left/right). joint_angles = 14 rad."""
+        if joint_angles_rad is None:
+            rospy.logwarn("call_fk: joint_angles_rad unavailable")
+            return None
         rospy.wait_for_service("/ik/fk_srv", timeout=timeout)
         resp = rospy.ServiceProxy("/ik/fk_srv", fkSrv)(list(joint_angles_rad))
         if not resp.success:
@@ -292,6 +295,9 @@ class ArmController:
         if side not in ("left", "right"):
             raise ValueError("side must be left|right")
         q0 = self._read_arm_joints_rad(timeout=timeout)
+        if q0 is None:
+            rospy.logwarn("solve_ik_one_hand: /sensors_data_raw unavailable")
+            return False, []
         fk = self.call_fk(q0, timeout=timeout)
         if fk is None:
             return False, []
@@ -508,12 +514,34 @@ class ClawController:
             return True
         return False
 
+    def left_holding(self):
+        """True si la pince GAUCHE tient quelque chose (miroir right_holding)."""
+        if self._left_state == 1:
+            return False
+        if self._left_state == 3:
+            return True
+        if self._left_state == 2 and self._left_pos >= 85.0:
+            return False
+        if self._left_state == 2 and 25.0 <= self._left_pos <= 82.0:
+            return True
+        if abs(self._left_effort) > 0.15 and self._left_state != 1:
+            return True
+        return False
+
     def describe_right(self):
         names = {0: "UNKNOWN", 1: "MOVING", 2: "REACHED", 3: "GRABBED"}
         return "R=%s pos=%.0f%% eff=%.2f hold=%s" % (
             names.get(int(self._right_state), str(self._right_state)),
             float(self._right_pos), float(self._right_effort),
             self.right_holding(),
+        )
+
+    def describe_left(self):
+        names = {0: "UNKNOWN", 1: "MOVING", 2: "REACHED", 3: "GRABBED"}
+        return "L=%s pos=%.0f%% eff=%.2f hold=%s" % (
+            names.get(int(self._left_state), str(self._left_state)),
+            float(self._left_pos), float(self._left_effort),
+            self.left_holding(),
         )
 
     def is_moving(self):
