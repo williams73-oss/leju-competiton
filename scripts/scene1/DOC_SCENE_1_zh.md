@@ -1,224 +1,377 @@
-# DOC SCENE 1 — 视觉与抓取（团队）
+# 挑战杯场景一（Scene1）技术方案文档
 
-**视觉作者：** Williams  
-**更新日期：** 2026-07-15  
-**重点：** 头部检测 + 腕部相机微调；抓取 / 称重 / 交接沿用主办动作结构。
+| 项目 | 内容 |
+|------|------|
+| **场景** | Scene1 — 桌面四包裹分拣（检测 → 抓取 → 称重 → 投箱） |
+| **文档性质** | 技术方案（提交用，单文件完整版） |
+| **作者 / 视觉与任务实现** | Williams |
+| **更新日期** | 2026-07-19 |
+| **代码仓库** | https://github.com/williams73-oss/leju-competiton |
+| **运行入口** | `rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed <N>` |
 
-**French：** [`DOC_SCENE_1.md`](./DOC_SCENE_1.md)  
-**仓库：** https://github.com/williams73-oss/leju-competiton
-
----
-
-## 0. 别人能不能下载后直接跑？
-
-**能跑起来，有条件。**  
-对方必须已有主办仿真环境，并把本仓库装进 `challenge_cup_task_template`（见 §1）。  
-本仓库 **不是** 整套仿真。
-
-- **能做的：** 按 §1 安装后，`rosrun … --scene scene1` 会启动完整任务（检测→抓→称→交接→投箱），代码与扩展 `robot_api` 齐全。
-- **不能保证的：** 每个 seed 都 4/4 成功。已验证较好例子含 seed **30**；成功依赖 OpenCV + 仿真服务（夹爪 / IK / FK）正常。
-- **不会单独工作：** 只 clone、没有主办 Docker / `kuavo_ws`。
+> **说明：** 本文档为提交要求中的「一、技术方案文档」唯一正文。  
+> 部署与运行说明见文末 **§8**；代码结构见 **§2 / §9**。  
+> 压缩包命名请按主办要求：`题目编号＋学校或单位＋团队负责人`。
 
 ---
 
-## 1. 从零运行（克隆 → 安装 → 启动）
+## 1. 作品总体设计方案
 
-### 1.1 前置条件
+### 1.1 任务目标
 
-- 已安装主办环境：`kuavo_challenge_cup_2026` Docker 镜像（或等价 `kuavo_ws`）
-- 能正常启动仿真并跑官方 `challenge_task.py`
-- 有 GPU / 显示（与官方一样）
-- **Python 依赖（视觉必需）：** 在仿真容器 / 环境里安装：
-  ```bash
-  pip3 install opencv-python open3d
-  # 或你团队 monorepo 里的 docker/install_perception_deps.sh（本 GitHub 仓库不含该脚本）
-  ```
-  没有 `opencv-python` → 颜色/腕部视觉会弱或跳过，任务很难成功。  
-  没有 `open3d` → LiDAR 可回退 2D（能跑，质量略差）。
+在官方统一仿真环境中，完成 Scene1：
 
-### 1.2 下载本仓库代码
+1. 识别桌面上 **4 个不同颜色包裹**（棕 / 黄 / 橙 / 蓝 → `parcel_1…4`）；
+2. 右手抓取 → 放置称重区 → 再抓取；
+3. 腰部转向后将包裹投入投递箱；
+4. 在多 seed 下尽量稳定完成全流程。
 
-```bash
-cd /tmp
-git clone https://github.com/williams73-oss/leju-competiton.git
+**硬约束（反作弊）：** 手臂控制 **禁止** 使用 `/mujoco/qpos`、`/ground_truth/state` 等仿真真值直接驱动；任务坐标来自相机感知与官方运动学接口。
+
+### 1.2 设计原则
+
+| 原则 | 具体做法 |
+|------|----------|
+| **感知可靠优先** | 早期 LiDAR+融合链路偏慢、对桌面多色纸箱适配差 → 改为 **头部 RGB-D 颜色分割 + 深度反投影** |
+| **动作可复现** | 抓取 / 称重关键位姿对齐主办脚本常量（如 `WEIGH_RELEASE_IK` / `WEIGH_REGRASP_IK`），减少“自创轨迹”带来的不稳定 |
+| **安全走廊** | 桌面上方采用高净空接近与返回，避免扫倒邻箱 |
+| **闭环确认** | 抓取后用夹爪行程/力矩做 **握持检测（grip-test）**，避免空爪进入称重 |
+| **可切换后端** | 保留旧 LiDAR 管线配置开关，便于对比与回退 |
+
+### 1.3 方案一句话总结
+
+> **用头部 RGB-D（LAB/HSV + Depth）完成“谁在哪”的检测，用腕部相机做抓取前微调，用右手单臂完成抓取—称重—投箱；全程不依赖仿真真值控臂。**
+
+---
+
+## 2. 系统架构及任务实现流程
+
+### 2.1 软件架构
+
+```
+challenge_task.py          ← 统一入口（启动仿真、seed、场景分发）
+        │
+        ▼
+scene1_task.py             ← Scene1 编排
+        │
+        ├─ config.py       ← 模式开关、阈值、后端选择
+        │
+        ├─ 感知  perception.py     （RGB-D 头相机，无 LiDAR）
+        └─ 动作  actions.py
+                 ├─ 构建抓取 jobs（含 tip offset）
+                 ├─ wrist_refine.py（右腕 cam_r 微调）
+                 ├─ 抓取 + grip-test
+                 ├─ 称重 / 再抓（模板位姿）
+                 └─ 腰部 + 伸臂投箱 + 高走廊回位
 ```
 
-本仓库根目录 ≈ ROS 包 `challenge_cup_task_template`，关键文件：
+底层能力由模板封装提供：
+
+- `src/robot_api.py`：手臂 / 夹爪 / IK·FK / hold
+- `src/perception_api.py`：头/腕相机、（可选）LiDAR、TF
+
+### 2.2 任务实现流程（当前默认）
+
+```
+① 低头看桌（HEAD yaw/pitch 对齐主办）
+② RGB-D 检测 4 色包裹 → base_link 坐标
+③ 对每个包裹（可按任务策略排序）：
+     a. 高位接近至包裹上方
+     b. 腕部相机 refine（小范围 Δxy）
+     c. 下行抓取 + 握持检测 / 加力夹紧
+     d. 移至称重区释放 → 固定再抓位姿夹起
+     e. 腰部转向 → 慢速伸臂 → 投箱
+     f. 高走廊收回 → 预设姿态（避免扫桌）
+④ 结束 / 进入下一包裹
+```
+
+**与早期“左右交接”方案的差异：**  
+当前稳定路径为 **右手贯穿至投箱**（减少一次空中交接失败点）。主办交接流程仍保留在 `actions.py` 中，可通过配置回退研究。
+
+### 2.3 关键文件一览（提交代码）
 
 | 路径 | 作用 |
 |------|------|
 | `scripts/challenge_task.py` | 三场景统一入口 |
-| `scripts/scene1_task.py` | Scene1 入口 |
-| `scripts/scene1/` | 感知 / 动作 / 配置 |
-| `src/robot_api.py` | 手臂/夹爪（含 FK、单臂 IK、hold…） |
-| `src/perception_api.py` | 相机 + LiDAR + TF |
+| `scripts/scene1_task.py` | Scene1 编排 |
+| `scripts/scene1/config.py` | 模式与参数 |
+| `scripts/scene1/perception.py` | RGB-D 感知（唯一） |
+| `scripts/scene1/actions.py` | 任务动作（唯一） |
+| `scripts/scene1/wrist_refine.py` | 腕部微调 |
+| `src/robot_api.py` / `perception_api.py` | 底层 API |
 
-### 1.3 装进工作空间（二选一）
+---
 
-**方式 A — 整包替换（推荐）**
+## 3. 关键算法原理与控制策略
 
-把现有包备份后，用本仓库覆盖：
+### 3.1 感知：为何放弃“以雷达为主”，改用图像
+
+#### 3.1.1 早期方案（LiDAR + 颜色融合）
+
+早期 `perception.py` 主路径：
+
+1. **LiDAR 聚类** 估计桌面物体“在哪”（XY）；
+2. **头部 RGB LAB/HSV** 判别“是谁”（颜色→parcel_id）；
+3. **深度 / 融合 / 2×2 网格兜底** 补全漏检。
+
+**实践中的问题：**
+
+| 问题 | 表现 |
+|------|------|
+| **耗时长** | 点云处理 + 多级融合，调试与单次检测延迟大，拖慢整局 |
+| **适配差** | 仿真中桌面纸箱纹理/高度变化下，聚类边界不稳定；颜色与簇关联易错配 |
+| **工程复杂** | 阈值多、失败模式多，不利于赛程内快速迭代 |
+| **依赖重** | Open3D 等在部分容器环境安装/版本敏感 |
+
+因此该管线保留为 `PERCEPTION_BACKEND="lidar"` **对比基线**，不再作为默认。
+
+#### 3.1.2 现行方案（头部 RGB-D 图像法）— `perception.py`
+
+**输入：** 头相机压缩彩色图 + 压缩深度图 + `camera_info`  
+**输出：** 最多 4 个检测 `{name, label, base_link_xyz_m, …}`
+
+**步骤概要：**
+
+1. **颜色分割**
+   - 蓝色优先走 **HSV**（色相分离好）；
+   - 棕/黄/橙等暖色主要用 **LAB 距离** 相对材质参考色（`PARCEL_REF_BGR`），减少 HSV 暖色重叠误分；
+2. **形态学 / 面积过滤** 去噪；
+3. **深度采样** 得到相机系 3D 点；
+4. **TF** 变换到 `base_link`（或任务目标系）；
+5. 每类最多 1 个，输出有序包裹列表。
+
+**优点：** 延迟更低、颜色语义直接、与“四色纸箱”任务高度匹配；调试可存 overlay 图像。
+
+### 3.2 腕部微调（多视角闭环）
+
+头相机在桌面尺度上够用，但抓取闭合前仍有数厘米误差。  
+在右手已位于包裹上方时：
+
+1. 用 **右腕相机 `cam_r`** 再跑同一套颜色/深度感知；
+2. 匹配同名包裹；
+3. 仅在 **小范围**（如 Δxy ≤ 4 cm）修正 `pick_ik`，避免大跳导致发散。
+
+开关：`SCENE1_ENABLE_WRIST_REFINE`（默认开）。
+
+### 3.3 抓取与夹爪策略
+
+1. **Tip / FK 偏移：** 使用主办标定式 offset（`VISION_PICK_CENTER_OFFSET=None` → 调用 `_right_pick_offset_for_parcel`）。若置零，易出现 tip 偏前、空抓。
+2. **浅抓取高度：** 控制 IK 深度，减少过深导致的 IK 失败。
+3. **握持检测（grip-test）：** 闭合后观察位置/力矩是否“被挡住”；判定持有后再加力。避免仿真中“假 REACHED / 假 hold”导致中途张爪掉箱。
+4. **禁止空中误开爪：** 早期曾用“MAIN VIDE”类逻辑误判后张爪 → 已移除；仅在称重释放等明确步骤开爪。
+
+### 3.4 称重与再抓
+
+对齐主办固定位姿序列：
+
+- 释放：`WEIGH_RELEASE_IK`
+- 再抓：`WEIGH_REGRASP_IK`（一次性到位，不做 tip/网格自创低位）
+
+减少“自研低位轨迹”导致的碰桌、漏抓。
+
+### 3.5 投箱与回位（防扫桌）
+
+- 腰部转向后 **慢速笛卡尔伸臂** 投箱；
+- 收回时先走 **高走廊**（如 z≈0.55），再回预设关节；
+- 避免贴桌横向扫掠，减少邻箱被撞倒。
+
+---
+
+## 4. 创新点（多模态感知 / 融合 / 控制）
+
+对应评分「创新性 0—8 分」，本方案要点：
+
+### 4.1 感知路径选型创新（问题驱动）
+
+不是简单堆叠传感器，而是基于实测对比做出 **默认管线切换**：
+
+- **从“雷达定位为主 + 视觉贴标签”** → **“视觉语义定位为主（RGB-D）”**；
+- LiDAR 管线降级为可切换基线，服务对比与可迁移说明。
+
+### 4.2 双相机分层感知
+
+| 层级 | 传感器 | 作用 |
+|------|--------|------|
+| 全局 | 头 RGB-D | 身份 + 粗位姿 |
+| 局部 | 腕 RGB-D | 闭合前精修 |
+
+形成 **远—近、粗—精** 的轻量多模态闭环，无需重型学习模型（适配赛方容器旧 Torch，已放弃 YOLO）。
+
+### 4.3 颜色空间分工（算法细节）
+
+- HSV 擅长蓝色；
+- LAB 距离擅长暖色纸箱材质；
+- 与场景材质参考色绑定，提升四类可分性。
+
+### 4.4 控制侧“感知—执行”耦合创新
+
+- **握持检测** 把夹爪反馈纳入任务状态机，而不只信末端到位；
+- **高净空运动原语** 作为桌面操作默认策略，提升多箱场景鲁棒性；
+- **称重位姿与主办对齐**，在合规前提下降低运动学不确定性。
+
+### 4.5 工程可回退设计
+
+工程上保留经典视觉参数可调（阈值颜色、腕部 refine），便于迁移到相近桌面分拣任务。
+
+---
+
+## 5. 仿真测试过程、结果及实验对比
+
+### 5.1 测试环境
+
+- 官方 Docker / `kuavo_ws` 仿真；
+- 入口：`challenge_task.py --scene scene1 --seed <N>`；
+- 调试 seed 示例：**17**；历史较好案例含 **30**；
+- **注意：** 同时只跑一个任务进程，否则易出现 `set_object_position is locked`。
+
+### 5.2 对比实验（感知）
+
+| 方案 | 主要手段 | 耗时/复杂度 | 任务适配 | 结论 |
+|------|----------|-------------|----------|------|
+| A 旧默认 | LiDAR 聚类 + RGB 贴标签 + 融合/网格 | 高 | 中等，错配多 | 作基线保留 |
+| B 图像默认 | 头 RGB-D LAB/HSV + Depth + TF | 较低 | 高（四色箱） | **采用为默认** |
+| C YOLO | 深度学习检测 | 容器 Torch 过旧 | — | **放弃** |
+
+### 5.3 动作侧问题与修复（过程记录）
+
+| 现象 | 原因分析 | 对策 |
+|------|----------|------|
+| 抓后掉落 | 空爪误判张爪 | 去掉错误 MAIN VIDE 开爪；grip-test |
+| 称重后再抓失败 | 自研 tip/低位与主办不符 | 固定 `WEIGH_*` 位姿 |
+| 扫倒邻箱 | 贴桌横移 / 过低回位 | 高走廊 + 慢速伸臂 |
+| tip 偏、空抓 | FK≠TCP，offset 被置零 | 恢复主办 tip offset |
+| 腕部发散 | Δxy 过大 | 限制最大修正 |
+
+### 5.4 结果说明（诚实表述）
+
+- 头部图像检测在多 seed 调试中可稳定给出四色目标；腕部 refine 降低闭合偏差；
+- 全流程成功率仍依赖仿真夹爪/IK 服务状态与 seed 几何；**不保证任意 seed 4/4**；
+- 已在若干 seed（如 17 调试、30 历史）上验证关键环节（检测→抓→称→投）可跑通；
+- 详细日志关键字：`DETECT` / `WRIST` / `PICK` / `GRIP` / `WEIGH` / `BOX` / `DONE`。
+
+> 若提交材料需附曲线/截图，建议另附 1—2 页附录图（overlay、关键日志片段），正文保持本文件单文档结构。
+
+---
+
+## 6. 方案的通用性与可迁移性
+
+| 维度 | 说明 |
+|------|------|
+| **换 seed** | 检测不绑死绝对世界坐标；颜色模型 + TF 随场景变化 |
+| **换参数** | 颜色阈值 / 腕部 refine 可按场地调 |
+| **动作策略** | 右手贯穿至投箱；称重位姿对齐主办常量 |
+| **换平台** | 依赖官方 `robot_api` / `perception_api` 与 ROS 话题，未改仿真控制器内核 |
+| **无重模型** | 经典视觉为主，降低对特定 GPU/Torch 版本绑定 |
+| **场景扩展** | 腕—头分层、高走廊、握持确认可迁移到其他桌面拣选任务 |
+
+**未修改** 官方仿真核心控制器；若将来修改，将在本文档补充说明（按主办要求）。
+
+---
+
+## 7. 总结与后续改进方向
+
+### 7.1 总结
+
+本方案完成了从「LiDAR 为主的复杂融合」到「RGB-D 图像语义定位 + 腕部精修 + 稳健单臂作业」的迭代：
+
+- **感知更快、更贴四色纸箱任务；**
+- **动作与主办关键位姿对齐，并加入握持与防扫桌策略；**
+- **保持可回退与可对比，便于评审理解技术路线。**
+
+### 7.2 后续改进
+
+1. 多 seed 自动化评测脚本与成功率统计表（充实实验对比）；
+2. 腕部伺服符号/增益自适应，进一步降低 `frac`；
+3. 在稳定前提下评估是否恢复左手交接以贴合主办完整流水线；
+4. 光照/曝光变化下的颜色模型自适应；
+5. 可选轻量 ONNX 检测作为第三后端（需验证容器推理环境）。
+
+---
+
+## 8. 代码部署、编译、启动与运行说明
+
+### 8.1 环境
+
+- 官方 `kuavo_challenge_cup_2026` Docker（或等价 `kuavo_ws`）；
+- 已能运行官方 `challenge_task.py`；
+- Python：`pip3 install opencv-python`（图像感知必需）；Open3D 仅旧 LiDAR 后端需要。
+
+### 8.2 安装本仓库
 
 ```bash
-# 例：主办工作空间路径按你的机器改
-WS=~/leju-kuavo-challenge-cup-2026   # 或 /root/kuavo_ws（容器内）
-PKG=$WS/src/challenge_cup_task_template
+cd /tmp
+git clone https://github.com/williams73-oss/leju-competiton.git
 
-mv "$PKG" "${PKG}.bak_$(date +%Y%m%d)"   # 备份
+WS=/root/kuavo_ws   # 或主机工作空间路径
+PKG=$WS/src/challenge_cup_task_template
+mv "$PKG" "${PKG}.bak_$(date +%Y%m%d)"
 cp -a /tmp/leju-competiton "$PKG"
 ```
 
-**方式 B — 只覆盖 Scene1 相关文件**
+若修改了 `CMakeLists.txt` / `package.xml`，再执行：
 
 ```bash
-PKG=~/leju-kuavo-challenge-cup-2026/src/challenge_cup_task_template
-SRC=/tmp/leju-competiton
-
-cp -a "$SRC/scripts/scene1" "$PKG/scripts/"
-cp -a "$SRC/scripts/scene1_task.py" "$PKG/scripts/"
-cp -a "$SRC/src/robot_api.py" "$PKG/src/"
-cp -a "$SRC/src/perception_api.py" "$PKG/src/"
+cd $WS && catkin build challenge_cup_task_template
 ```
 
-若改过 `CMakeLists` / `package.xml`，在工作空间里重新 `catkin build challenge_cup_task_template`（或团队惯用编译命令）。
+纯 Python 脚本迭代通常 **无需重编译**。
 
-### 1.4 配置模式（`scripts/scene1/config.py`）
-
-一次只开一种：
-
-| 设置 | 含义 |
-|------|------|
-| `PERCEPTION_ONLY = True` | 只跑检测，手臂不动（视觉调试） |
-| `TOUCH_TEST = True`（且上面 False） | 检测后点触 |
-| **两个都 False** | **完整任务**：抓 → 称 → 交接 → 投箱 |
-
-当前团队默认：**两个都 `False`（完整任务）**，`FORCE_PARCEL_NAME = None`（四个包裹）。
-
-### 1.5 启动 Scene1
-
-在 **已 source 的仿真环境**里（容器或主机，与官方相同）：
-
-```bash
-source /root/kuavo_ws/devel/setup.zsh   # 路径按实际改
-# 或: source ~/leju-kuavo-challenge-cup-2026/devel/setup.zsh
-
-rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 30
-```
-
-换种子：改 `--seed`（例：`0`、`30`、`400`）。
-
-### 1.6 日志里看什么
-
-```text
-DETECT | COLOR | FUSE | WRIST | VISION | Grabbed | DONE | claw
-```
-
-成功抓取示例：`VISION OK`、`claw R=3`（Grabbed）、然后称重 / 交接。
-
-### 1.7 可选：本机 monorepo 里的 Docker 快捷脚本
-
-若你有完整仓库 `leju-kuavo-challenge-cup-2026` **并且**里面有 `docker/run_scene1_*.sh`：
-
-```bash
-cd ~/leju-kuavo-challenge-cup-2026
-bash docker/stop_scene1.sh
-bash docker/run_scene1_mission.sh 30 900
-```
-
-这些脚本 **不在** GitHub `leju-competiton` 里；没有它们时用上面的 **`rosrun`** 即可。
-
-`Ctrl+C` 只停终端，不一定停 Docker — 有 `stop_scene1.sh` 时再用它。
-
----
-
-## 2. 项目思路
-
-**视觉目标：** 找到 4 个包裹（谁 / 在哪），**不作弊**（不用 MuJoCo GT 控臂）。
-
-动作结构参考主办：  
-`challenge_cup_simulator/.../collect_scene1_handoff_dataset.py`  
-（检测 → 右手抓 → 称重 → 再抓 → 交接 → 投箱）。
-
-**视觉核心：** `perception.py` + `wrist_vision.py` + `config.py`。  
-**反作弊：** 禁止 `/mujoco/qpos` / GT 控臂；`GT_COMPARE` 仅实验室。
-
----
-
-## 3. 场景目标
-
-4 包裹 → 右手抓 → 称重 → 再抓 → 左手 → 投箱。
-
----
-
-## 4. 关键文件
-
-| 文件 | 作用 |
-|------|------|
-| `perception.py` | 头：LiDAR + RGB LAB/HSV + depth → 4 包裹 |
-| `wrist_vision.py` | 腕：颜色/深度 blob + 小步 Δxy |
-| `config.py` | 模式、阈值、WRIST_*、FORCE_PARCEL |
-| `actions.py` | 抓取/称重/交接 |
-| `../scene1_task.py` | 场景入口 |
-| `../../src/perception_api.py` | 相机 + LiDAR + TF |
-| `../../src/robot_api.py` | 手臂/夹爪（含 FK / 单臂 IK 等） |
-
----
-
-## 5. 架构
-
-```
-HEAD detect → 接近 → HAND refine → GRASP close
-```
-
----
-
-## 6. 已验证
-
-| Seed / 包裹 | 结果 |
-|-------------|------|
-| Seed **30**, `parcel_1` | VISION OK + Grabbed |
-| Seed **0** 头部 | 4/4，`err_structure_2x2 ≈ 0.009` m |
-| Seed **400**, 黄 `parcel_2` | 按需复测 |
-
----
-
-## 7. 配置速查
+### 8.3 关键配置（`scripts/scene1/config.py`）
 
 ```python
-PERCEPTION_ONLY = False
-TOUCH_TEST = False
-FORCE_PARCEL_NAME = None   # 或 "parcel_2" 强制黄箱
+PERCEPTION_ONLY = False   # False = 完整任务；True = 仅检测
+GT_COMPARE = False        # 比赛/正式任务必须 False
 ```
 
-| Name | 颜色 |
+### 8.4 启动
+
+```bash
+source /root/kuavo_ws/devel/setup.zsh
+rosrun challenge_cup_task_template challenge_task.py --scene scene1 --seed 17
+```
+
+**建议：** 新开跑前 `docker restart <容器名>` 并等待就绪；同一时间只跑一个任务。
+
+### 8.5 依赖与模型
+
+- **不依赖** YOLO / 大模型权重（已从提交流程中排除重模型目录）；
+- 必需：OpenCV；可选：Open3D（仅 LiDAR 后端）。
+
+### 8.6 日志排查
+
+```bash
+grep -E 'DETECT|WRIST|PICK|GRIP|WEIGH|BOX|DONE|FAIL|locked' /tmp/*.log | tail -80
+```
+
+---
+
+## 9. 提交材料清单（对照主办“二、代码及算法材料”）
+
+| 材料 | 本仓库对应 |
+|------|------------|
+| 完整源代码 | 本包 `scripts/` + `src/` |
+| 任务执行脚本 | `scripts/challenge_task.py`、`scene1_task.py`（及 scene2/3 入口） |
+| 配置文件 | `scripts/scene1/config.py` |
+| 模型文件 | 无必需权重；感知为经典视觉 |
+| 依赖说明 | 见 §8.1 / §8.5 |
+| 部署运行说明 | 见 §8 |
+| 技术方案文档 | **本文档（单文件）** |
+
+---
+
+## 附录 A — 包裹颜色约定
+
+| 名称 | 颜色 |
 |------|------|
-| `parcel_1` | 棕/灰 |
+| `parcel_1` | 棕 / 灰褐 |
 | `parcel_2` | 黄 |
 | `parcel_3` | 橙 |
 | `parcel_4` | 蓝 |
 
----
+## 附录 B — 法文开发笔记
 
-## 8. robot_api 说明（必读）
-
-`actions.py` 需要相对 **原版模板** 多出的接口，本仓库 **已写入** `src/robot_api.py`：
-
-| 接口 | 作用 |
-|------|------|
-| `_read_arm_joints_rad()` | 读 14 臂关节（传感器） |
-| `call_fk()` | 正运动学 |
-| `solve_ik_one_hand()` | 单臂 IK（另一手锁定） |
-| `_last_cmd_deg` | 上次下发的关节角 |
-| `right_holding()` | 右爪是否抓稳 |
-| `describe_right()` | 右爪状态文字 |
-| imports `fkSrv` / `sensorsData` | FK 服务与传感器消息 |
-
-同事若仍用旧 `robot_api`，运行到抓取/交接会缺方法。  
-**请使用本仓库的 `src/robot_api.py`。**
+日常开发备忘（非提交正文）：[`DOC_SCENE_1.md`](./DOC_SCENE_1.md)
 
 ---
 
-## 9. 链接
-
-- 主办参考：`collect_scene1_handoff_dataset.py`
-- 团队仓库：https://github.com/williams73-oss/leju-competiton
+**文档结束。**

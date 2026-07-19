@@ -163,7 +163,7 @@ def run_scene(scene, seed, node_name=None, timeout=120,
 
     if scene == "scene1":
         from scene1_task import run_scene1
-        run_scene1(robot, arm, claw, head, log)
+        run_scene1(robot, arm, claw, head, log, seed=seed)
     elif scene == "scene2":
         from scene2_task import run_scene2
         run_scene2(robot, arm, claw, head, log)
