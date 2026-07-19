@@ -19,6 +19,9 @@ STATIC_SOURCES = {
     "parcel_4": [-0.11, -0.09, 0.880],
 }
 
+# Debug : après 1er "main au-dessus du colis" → log angles pince + STOP mission
+DEBUG_STOP_ABOVE_FIRST_PARCEL = False  # True = stop + log angles au-dessus du 1er colis
+
 # Flux post-prise (copié de ton scene1/config + actions)
 WAIST_BOX_YAW_DEG = 30.0
 WAIST_BOX_SETTLE_SEC = 2.4
@@ -322,6 +325,72 @@ def _safe_return_preset(sc1, arm_pub, arm_hold, quat=None):
         rospy.logwarn("[PRESET] move_arm_to final fail (%s) — fallback spline", exc)
         sc1._move_through_preset(arm_pub, arm_hold)
     rospy.sleep(float(sc1.PRESET_SETTLE_TIME))
+
+
+def _quat_angle_error_deg(actual_xyzw, desired_xyzw):
+    """Angle between two quats (deg), same convention as orga collect."""
+    import math
+
+    a = [float(v) for v in actual_xyzw]
+    b = [float(v) for v in desired_xyzw]
+    # q_err = a * conj(b) → angle = 2*acos(|w|)
+    # conj(b) = (-x,-y,-z,w)
+    ax, ay, az, aw = a
+    bx, by, bz, bw = -b[0], -b[1], -b[2], b[3]
+    w = aw * bw - ax * bx - ay * by - az * bz
+    w = max(-1.0, min(1.0, abs(w)))
+    return math.degrees(2.0 * math.acos(w))
+
+
+def _debug_dump_gripper_angles(sc1, commanded_quat, pick_ik, label="above"):
+    """Log quat commandé + FK réel + 7 joints bras D (deg) — pour lire l'orientation pince."""
+    import math
+    import rospy
+
+    q_cmd = [float(v) for v in commanded_quat]
+    q_fk = _current_right_quat(sc1)
+    xyz = _current_right_xyz(sc1)
+    joints_rad = sc1._read_current_arm_joints(sc1.TOPIC_TIMEOUT)
+    right7 = [math.degrees(float(joints_rad[i])) for i in range(7, 14)]
+    try:
+        err_deg = _quat_angle_error_deg(q_fk, q_cmd)
+    except Exception:
+        err_deg = -1.0
+    approach_z = max(
+        float(PICK_APPROACH_IK_Z),
+        float(getattr(sc1, "RIGHT_PICK_TRANSIT_IK_Z", PICK_APPROACH_IK_Z) or PICK_APPROACH_IK_Z),
+    )
+    rospy.loginfo("=" * 60)
+    rospy.loginfo("[DEBUG-ANGLE] STOP au-dessus colis (%s)", label)
+    rospy.loginfo(
+        "[DEBUG-ANGLE] pick_ik cible (dessus)=[%.3f, %.3f, %.3f]",
+        float(pick_ik[0]), float(pick_ik[1]), approach_z,
+    )
+    rospy.loginfo(
+        "[DEBUG-ANGLE] xyz FK main D = [%.4f, %.4f, %.4f]",
+        xyz[0], xyz[1], xyz[2],
+    )
+    rospy.loginfo(
+        "[DEBUG-ANGLE] quat COMMANDÉ (orga pick) xyzw = [%.4f, %.4f, %.4f, %.4f]",
+        q_cmd[0], q_cmd[1], q_cmd[2], q_cmd[3],
+    )
+    rospy.loginfo(
+        "[DEBUG-ANGLE] quat FK RÉEL         xyzw = [%.4f, %.4f, %.4f, %.4f]",
+        q_fk[0], q_fk[1], q_fk[2], q_fk[3],
+    )
+    rospy.loginfo("[DEBUG-ANGLE] écart ori cmd↔FK = %.1f deg", err_deg)
+    rospy.loginfo(
+        "[DEBUG-ANGLE] orga YPR commande = 1er[0, -90, 0]  2e[90, 0, 0]  (flat orga)",
+    )
+    rospy.loginfo(
+        "[DEBUG-ANGLE] joints bras D (deg) j0..j6 = [%s]",
+        ", ".join("%.2f" % v for v in right7),
+    )
+    rospy.loginfo(
+        "[DEBUG-ANGLE] poignet D j4,j5,j6 (deg) = [%.2f, %.2f, %.2f]",
+        right7[4], right7[5], right7[6],
+    )
+    rospy.loginfo("=" * 60)
 
 
 def _go_above_parcel_centered(sc1, arm_pub, arm_hold, pick_ik, quat):
@@ -970,12 +1039,40 @@ def _confirm_good_grasp(sc1, arm_pub, arm_hold, gripper_hold, claw_mon, pick_qua
     return False
 
 
+def _close_and_lift_after_servo(sc1, arm_pub, arm_hold, gripper_hold,
+                                pick_ik, pick_quat, label):
+    """Pince déjà au-dessus / au contact : close + lift (pas de plongée)."""
+    import rospy
+
+    pick_ik = list(pick_ik)
+    # Micro-ajustement final (déjà placé par le servo)
+    try:
+        sc1._move_hand_precise(
+            "right", arm_pub, arm_hold, pick_ik, list(pick_quat),
+            "%s_final_grasp" % label,
+        )
+    except Exception as exc:
+        rospy.logwarn("[PICK] %s final precise: %s — close quand même", label, exc)
+
+    gripper_hold.set_right_closed()
+    rospy.sleep(float(getattr(sc1, "GRIPPER_CLOSE_HOLD_TIME", 1.0) or 1.0))
+    _gripper_secure_close(sc1, gripper_hold, "right", hold_s=0.8, pulses=2)
+
+    lift_z = float(getattr(sc1, "WEIGH_TRANSIT_IK_Z", CLEARANCE_IK_Z) or CLEARANCE_IK_Z)
+    lift_ik = sc1._with_ik_z(pick_ik, lift_z)
+    sc1._move_right_cartesian_to(
+        arm_pub, arm_hold, lift_ik, list(pick_quat),
+        "%s_soft_lift" % label,
+        n_points=SLOW_CART_POINTS, seg_time=SLOW_CART_SEG,
+    )
+
+
 def _pick_parcel_secure(sc1, arm_pub, arm_hold, gripper_hold, job, pick_quat,
                         claw_mon=None):
     """
     PRISE table :
-      open → au-dessus → (wrist XY) → descente orga → close → lift
-      → CONFIRM bonne prise (sinon raise, pas de pesée).
+      open → au-dessus → descente PAR PALIERS + centrage cam_r chaque fois
+      → close → lift → CONFIRM (sinon abort, pas de pesée).
     """
     import rospy
 
@@ -989,27 +1086,46 @@ def _pick_parcel_secure(sc1, arm_pub, arm_hold, gripper_hold, job, pick_quat,
 
     _gripper_max_open(sc1, gripper_hold, "right")
     _go_above_parcel_centered(sc1, arm_pub, arm_hold, pick_ik, pick_quat)
+
+    # Debug demandé : main au-dessus → lire angles pince → STOP (pas de descente)
+    if DEBUG_STOP_ABOVE_FIRST_PARCEL:
+        _debug_dump_gripper_angles(
+            sc1, pick_quat, pick_ik, label=name,
+        )
+        raise RuntimeError("DEBUG_STOP_ABOVE_PARCEL (%s)" % name)
+
+    servo_ok = False
     try:
         try:
-            from scene1.wrist_refine import refine_job_pick_with_wrist
+            from scene1.wrist_refine import servo_descend_to_mid_parcel
         except ImportError:
-            from wrist_refine import refine_job_pick_with_wrist
-        job = refine_job_pick_with_wrist(
+            from wrist_refine import servo_descend_to_mid_parcel
+        job = servo_descend_to_mid_parcel(
             sc1, arm_pub, arm_hold, job, pick_quat,
+            final_z=float(pick_ik[2]),
             output_dir="/tmp/scene1_wrist",
         )
         pick_ik = list(job["right_pick_ik"])
-        if job.get("wrist_refined"):
-            _go_above_parcel_centered(
-                sc1, arm_pub, arm_hold, pick_ik, pick_quat,
-            )
+        servo_ok = bool(job.get("wrist_refined"))
+        rospy.loginfo(
+            "[PICK] %s servo fin centered=%s dpx=%s ik=%s",
+            name, job.get("wrist_centered"), job.get("wrist_dpx"),
+            [round(v, 3) for v in pick_ik],
+        )
     except Exception as exc:
-        rospy.logwarn("[WRIST] refine skip: %s — pick tête", exc)
+        rospy.logwarn("[WRIST] servo skip: %s — fallback plongée orga", exc)
 
-    sc1._left_wait_and_right_pick_from(
-        arm_pub, arm_hold, gripper_hold,
-        pick_ik, pick_quat, name, carry_quat=pick_quat,
-    )
+    if servo_ok:
+        _close_and_lift_after_servo(
+            sc1, arm_pub, arm_hold, gripper_hold,
+            pick_ik, pick_quat, name,
+        )
+    else:
+        # Fallback : ancienne plongée orga si cam_r totalement KO
+        sc1._left_wait_and_right_pick_from(
+            arm_pub, arm_hold, gripper_hold,
+            pick_ik, pick_quat, name, carry_quat=pick_quat,
+        )
 
     if _confirm_good_grasp(
         sc1, arm_pub, arm_hold, gripper_hold, claw_mon, pick_quat, name,
@@ -1037,8 +1153,8 @@ def _ik_in_weigh_zone(xyz):
 
 def _detect_parcel_on_weigh_pad(sc1, parcel_name):
     """
-    Redétecte le colis sur la balance (RGB-D tête) — remplace le /mujoco/qpos orga.
-    Retourne [x,y,z]_IK ou None.
+    Redétecte le colis sur la balance (RGB-D tête) — comme la prise table.
+    Retourne right_pick_ik [x,y,z] (z = WEIGH_REGRASP) ou None.
     """
     import math
     import rospy
@@ -1054,7 +1170,9 @@ def _detect_parcel_on_weigh_pad(sc1, parcel_name):
         return None
 
     pad = list(sc1.WEIGH_RELEASE_IK)
-    best = None
+    regrasp_z = float(sc1.WEIGH_REGRASP_IK[2])
+    best_xyz = None
+    best_name = None
     best_d = 1e9
     for det in dets or []:
         name = det.get("name")
@@ -1068,20 +1186,30 @@ def _detect_parcel_on_weigh_pad(sc1, parcel_name):
         score = d - (0.15 if name == parcel_name else 0.0)
         if score < best_d:
             best_d = score
-            best = [ix, iy, float(xyz[2]) if len(xyz) > 2 else float(pad[2])]
-    if best is None:
+            best_xyz = [ix, iy, float(xyz[2]) if len(xyz) > 2 else float(pad[2])]
+            best_name = name or parcel_name
+    if best_xyz is None:
         rospy.logwarn("[WEIGH] aucun colis détecté sur pad")
         return None
+
+    # Même offset tip que la prise table
+    offset = pick_offset_for_detection(sc1, best_name, best_xyz)
+    pick_ik = [
+        float(best_xyz[0]) + float(offset[0]),
+        float(best_xyz[1]) + float(offset[1]),
+        regrasp_z,
+    ]
     rospy.loginfo(
-        "[WEIGH] vision pad → %s ik_xy=(%.3f,%.3f)",
-        parcel_name, best[0], best[1],
+        "[WEIGH] vision pad → %s det=(%.3f,%.3f) off=(%.3f,%.3f) → ik=(%.3f,%.3f,%.3f)",
+        best_name, best_xyz[0], best_xyz[1], offset[0], offset[1],
+        pick_ik[0], pick_ik[1], pick_ik[2],
     )
-    return best
+    return pick_ik
 
 
 def _regrasp_once(sc1, arm_pub, arm_hold, gripper_hold, claw_mon,
                   regrasp_ik, weigh_z, regrasp_quat, close_hold, label):
-    """Une reprise orga : pre (z=release) → down WEIGH_REGRASP z → close → grip-test."""
+    """Une reprise : pre (z=release) → down → close → grip-test (comme descente prise)."""
     import rospy
 
     regrasp_ik = list(regrasp_ik)
@@ -1124,6 +1252,91 @@ def _regrasp_once(sc1, arm_pub, arm_hold, gripper_hold, claw_mon,
     return (not empty), regrasp_pre_cmd14
 
 
+def _regrasp_like_pick(sc1, arm_pub, arm_hold, gripper_hold, claw_mon, job,
+                       target_ik, weigh_z, regrasp_quat, close_hold, label):
+    """
+    Reprise balance = même logique que prise table :
+      open → au-dessus → descente par paliers + centrage cam_r → close.
+    """
+    import rospy
+
+    target_ik = list(target_ik)
+    target_ik[2] = float(sc1.WEIGH_REGRASP_IK[2])
+    mini_job = {
+        "object": job.get("object"),
+        "right_pick_ik": list(target_ik),
+        "source_world": job.get("source_world"),
+        "perception": dict(job.get("perception") or {}),
+    }
+
+    _gripper_max_open(sc1, gripper_hold, "right")
+    _go_above_parcel_centered(
+        sc1, arm_pub, arm_hold, target_ik, list(regrasp_quat),
+    )
+
+    servo_ok = False
+    try:
+        try:
+            from scene1.wrist_refine import servo_descend_to_mid_parcel
+        except ImportError:
+            from wrist_refine import servo_descend_to_mid_parcel
+        mini_job = servo_descend_to_mid_parcel(
+            sc1, arm_pub, arm_hold, mini_job, list(regrasp_quat),
+            final_z=float(target_ik[2]),
+            output_dir="/tmp/scene1_wrist_weigh",
+        )
+        target_ik = list(mini_job["right_pick_ik"])
+        target_ik[2] = float(sc1.WEIGH_REGRASP_IK[2])
+        servo_ok = bool(mini_job.get("wrist_refined"))
+        rospy.loginfo(
+            "[WEIGH] %s servo centered=%s dpx=%s → %s",
+            label,
+            mini_job.get("wrist_centered"),
+            mini_job.get("wrist_dpx"),
+            [round(v, 3) for v in target_ik],
+        )
+    except Exception as exc:
+        rospy.logwarn(
+            "[WEIGH] %s wrist servo skip: %s — reprise orga", label, exc,
+        )
+
+    if servo_ok:
+        # Déjà en bas centré : close + grip-test (sans re-plonger)
+        try:
+            sc1._move_hand_precise(
+                "right", arm_pub, arm_hold, target_ik, list(regrasp_quat),
+                "%s_final" % label,
+            )
+        except Exception as exc:
+            rospy.logwarn("[WEIGH] %s final: %s", label, exc)
+        gripper_hold.set_right_closed()
+        rospy.sleep(float(close_hold))
+        held = _grip_test_and_squeeze(
+            sc1, gripper_hold, claw_mon, label=label,
+        )
+        gripper_hold.set_right_closed()
+        empty = (
+            not held
+            and claw_mon._fully_closed_empty()
+            and not claw_mon.likely_holding()
+        )
+        pre_cmd = None
+        try:
+            pre_ik = sc1._with_ik_z(target_ik, float(weigh_z))
+            pre_cmd = sc1._move_hand(
+                "right", arm_pub, arm_hold, pre_ik, list(regrasp_quat),
+                "%s_lift_pre" % label, settle_time=0.0,
+            )
+        except Exception:
+            pre_cmd = None
+        return (not empty), pre_cmd
+
+    return _regrasp_once(
+        sc1, arm_pub, arm_hold, gripper_hold, claw_mon,
+        target_ik, float(weigh_z), regrasp_quat, close_hold, label,
+    )
+
+
 def weigh_and_regrasp(sc1, arm_pub, arm_hold, gripper_hold, job, pick_quat, args,
                       claw_mon=None):
     """
@@ -1132,11 +1345,10 @@ def weigh_and_regrasp(sc1, arm_pub, arm_hold, gripper_hold, job, pick_quat, args
       place :
         transit → descend WEIGH_RELEASE_IK + quat orga release
         → settle 1.5s → open → dwell (pose calme, pas de jet)
-      regrasp :
-        pre z=release → down WEIGH_REGRASP_IK (z=-0.04) + quat orga regrasp
-        → close → lift
+      regrasp (comme prise table) :
+        detect pad (tête) → au-dessus → centrage cam_r → descente / close
       si main vide :
-        redétecte colis sur pad (vision) / offsets XY → retry (max 3)
+        redétecte + offsets XY → retry (max 3)
     """
     import rospy
 
@@ -1154,7 +1366,7 @@ def weigh_and_regrasp(sc1, arm_pub, arm_hold, gripper_hold, job, pick_quat, args
     close_hold = float(getattr(sc1, "GRIPPER_CLOSE_HOLD_TIME", 1.0) or 1.0)
 
     rospy.loginfo(
-        "[WEIGH] %s ORGA dépôt=%s reprise_z=%.3f quat_rel/regrasp ok",
+        "[WEIGH] %s dépôt=%s reprise=detect+wrist+down z=%.3f",
         name,
         [round(v, 3) for v in weigh_ik],
         float(regrasp_base[2]),
@@ -1194,58 +1406,51 @@ def weigh_and_regrasp(sc1, arm_pub, arm_hold, gripper_hold, job, pick_quat, args
     rospy.loginfo("[WEIGH] colis posé — dwell %.2fs (ne pas jeter / partir trop tôt)", dwell_calm)
     rospy.sleep(dwell_calm)
 
-    # --- Reprise : essai centre orga, puis vision + offsets ---
+    # --- Reprise = même schéma que prise : detect → above → wrist → down ---
     regrasp_pre_cmd14 = None
     held = False
     max_tries = int(WEIGH_REGRASP_MAX_TRIES)
     for attempt in range(1, max_tries + 1):
-        if attempt == 1:
-            target = list(regrasp_base)
-            label = "%s_regrasp_%d_orga" % (name, attempt)
-        else:
-            # Remonte un peu, pince ouverte, redétecte
-            try:
-                above = sc1._with_ik_z(regrasp_base, float(weigh_ik[2]) + 0.08)
-                sc1._move_hand(
-                    "right", arm_pub, arm_hold, above, regrasp_quat,
-                    "%s_regrasp_clear" % name,
-                )
-            except Exception as exc:
-                rospy.logwarn("[WEIGH] clear before redetect: %s", exc)
-            _gripper_max_open(sc1, gripper_hold, "right")
-            rospy.sleep(0.35)
+        # Remonte / ouvre avant chaque essai (sauf si déjà haut après dépôt)
+        try:
+            above = sc1._with_ik_z(regrasp_base, float(weigh_ik[2]) + 0.10)
+            sc1._move_hand(
+                "right", arm_pub, arm_hold, above, regrasp_quat,
+                "%s_regrasp_clear_%d" % (name, attempt),
+            )
+        except Exception as exc:
+            rospy.logwarn("[WEIGH] clear before detect: %s", exc)
+        _gripper_max_open(sc1, gripper_hold, "right")
+        rospy.sleep(0.35)
 
-            det_ik = _detect_parcel_on_weigh_pad(sc1, name)
-            if det_ik is not None:
-                target = [
-                    float(det_ik[0]),
-                    float(det_ik[1]),
-                    float(regrasp_base[2]),  # z orga reprise (-0.04)
-                ]
-                label = "%s_regrasp_%d_vision" % (name, attempt)
-                rospy.loginfo(
-                    "[WEIGH] essai %d/%d VISION → %s",
-                    attempt, max_tries, [round(v, 3) for v in target],
-                )
-            else:
-                ox, oy = WEIGH_REGRASP_XY_OFFSETS[
-                    (attempt - 1) % len(WEIGH_REGRASP_XY_OFFSETS)
-                ]
-                target = [
-                    float(regrasp_base[0]) + float(ox),
-                    float(regrasp_base[1]) + float(oy),
-                    float(regrasp_base[2]),
-                ]
-                label = "%s_regrasp_%d_off" % (name, attempt)
-                rospy.loginfo(
-                    "[WEIGH] essai %d/%d OFFSET (%.2f,%.2f) → %s",
-                    attempt, max_tries, ox, oy,
-                    [round(v, 3) for v in target],
-                )
+        det_ik = _detect_parcel_on_weigh_pad(sc1, name)
+        if det_ik is not None:
+            target = list(det_ik)
+            target[2] = float(regrasp_base[2])
+            label = "%s_regrasp_%d_vision" % (name, attempt)
+            rospy.loginfo(
+                "[WEIGH] essai %d/%d DETECT+WRIST → %s",
+                attempt, max_tries, [round(v, 3) for v in target],
+            )
+        else:
+            ox, oy = WEIGH_REGRASP_XY_OFFSETS[
+                (attempt - 1) % len(WEIGH_REGRASP_XY_OFFSETS)
+            ]
+            target = [
+                float(regrasp_base[0]) + float(ox),
+                float(regrasp_base[1]) + float(oy),
+                float(regrasp_base[2]),
+            ]
+            label = "%s_regrasp_%d_off" % (name, attempt)
+            rospy.logwarn(
+                "[WEIGH] essai %d/%d pas de detect — OFFSET (%.2f,%.2f) + wrist → %s",
+                attempt, max_tries, ox, oy,
+                [round(v, 3) for v in target],
+            )
 
         try:
-            held, regrasp_pre_cmd14 = _regrasp_once(
-                sc1, arm_pub, arm_hold, gripper_hold, claw_mon,
+            held, regrasp_pre_cmd14 = _regrasp_like_pick(
+                sc1, arm_pub, arm_hold, gripper_hold, claw_mon, job,
                 target, float(weigh_ik[2]), regrasp_quat, close_hold, label,
             )
         except Exception as exc:
